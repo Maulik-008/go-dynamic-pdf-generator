@@ -1,0 +1,83 @@
+# systemd unit for great-pdf-generator.
+#
+# NOT RUN IN THE ENVIRONMENT WHERE IT WAS WRITTEN — systemd is not PID 1
+# there, so this unit has never actually been started. Reviewed, not
+# verified. Validate with `systemd-analyze verify` and the smoke checks in
+# docs/guides/04-deployment.md before relying on it.
+#
+# Install:
+#   sudo cp deploy/systemd/great-pdf-generator.service /etc/systemd/system/
+#   sudo cp deploy/systemd/great-pdf-generator.env /etc/great-pdf-generator.env
+#   sudo useradd --system --home /var/lib/great-pdf-generator --create-home pdfsvc
+#   sudo install -m755 pdfsvc /usr/local/bin/pdfsvc
+#   sudo systemctl daemon-reload && sudo systemctl enable --now great-pdf-generator
+
+[Unit]
+Description=great-pdf-generator (HTML/Markdown to PDF service)
+Documentation=https://github.com/Maulik-zuru/great-pdf-generator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=pdfsvc
+Group=pdfsvc
+EnvironmentFile=/etc/great-pdf-generator.env
+ExecStart=/usr/local/bin/pdfsvc
+
+# The auto-restart this service does not provide for itself. RestartSec
+# spaces attempts out; StartLimit* stops a genuinely broken build (bad
+# CHROMIUM_PATH, missing fonts) from being restarted forever in a tight
+# loop — after 5 failures inside 5 minutes systemd gives up and leaves the
+# unit failed, which is visible in `systemctl status` instead of silently
+# burning CPU.
+Restart=always
+RestartSec=5s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Graceful shutdown: SIGTERM makes the service fail readiness, wait out
+# SHUTDOWN_GRACE, then drain in-flight renders. TimeoutStopSec must exceed
+# SHUTDOWN_GRACE plus the longest render (RenderOptions.Timeout, 30s by
+# default) or systemd will SIGKILL mid-drain and orphan Chromium processes.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+# Kill the whole cgroup on stop. This matters specifically here: the service
+# forks Chromium child processes, and killing only the main process would
+# leave them behind holding hundreds of MB each.
+KillMode=control-group
+
+# --- hardening -------------------------------------------------------------
+# This process executes customer-supplied HTML and JavaScript inside a
+# Chromium that runs with its own sandbox disabled (containers and many
+# hardened hosts do not grant the privileges it needs). These restrictions
+# are therefore doing real work, not box-ticking.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+# Chromium needs a writable home for its profile/cache.
+StateDirectory=great-pdf-generator
+Environment=HOME=/var/lib/great-pdf-generator
+
+# Chromium legitimately needs a large shared-memory area; too small a
+# /dev/shm is a known cause of renderer crashes on bigger documents.
+# PrivateTmp gives this unit its own /tmp and /dev/shm.
+
+# Memory ceiling. docs/research/load-test-results.md measured roughly 800MB
+# per Chromium instance under sustained heavy-document load (vs ~350MB
+# idle), so size this from the loaded figure times POOL_SIZE, plus headroom
+# for the Go process itself.
+MemoryMax=3G
+
+[Install]
+WantedBy=multi-user.target

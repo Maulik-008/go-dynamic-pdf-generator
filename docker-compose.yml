@@ -1,0 +1,62 @@
+# NOT RUN IN THE ENVIRONMENT WHERE IT WAS WRITTEN — no Docker daemon was
+# available there. Reviewed, not verified; smoke-test it per
+# docs/guides/04-deployment.md.
+
+services:
+  pdfsvc:
+    build: .
+    ports:
+      - "8080:8080"
+
+    # This is the auto-restart/supervision the service does not provide for
+    # itself: if the process exits for any reason, Docker starts it again.
+    # "unless-stopped" also survives a host reboot, while still respecting a
+    # deliberate `docker compose stop`.
+    restart: unless-stopped
+
+    # Chromium puts shared-memory files in /dev/shm. Docker's default is
+    # 64MB, which Chromium can exhaust on larger documents — the classic
+    # containerised-Chrome crash. Raising it is the fix that keeps rendering
+    # accurate; the commonly-suggested --disable-dev-shm-usage flag instead
+    # pushes that traffic onto disk, which is slower. Note this repo has NOT
+    # measured the effect of either setting.
+    shm_size: 1gb
+
+    environment:
+      CHROMIUM_PATH: /usr/bin/chromium
+      PORT: "8080"
+      # Size the pool to the CPU available to this container. Measured
+      # finding from docs/research/load-test-results.md: throughput plateaus
+      # at roughly one Chromium instance per core, so more instances than
+      # cores buys nothing and adds contention.
+      POOL_SIZE: "2"
+      MAX_CONCURRENCY_PER_INSTANCE: "6"
+      LOG_LEVEL: info
+      SHUTDOWN_GRACE: 5s
+
+    # Liveness-style check: is the process itself answering? It deliberately
+    # probes /livez, not /readyz — /readyz reports "not ready" while draining
+    # and when the pool is temporarily dead, and restarting the container on
+    # either of those would destroy the pool's own in-progress self-repair.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/pdfsvc", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    # Chromium is genuinely memory-hungry: docs/research/load-test-results.md
+    # measured roughly 800MB per instance under sustained heavy-document
+    # load, well above its ~350MB idle. Budget from the loaded figure, not
+    # the idle one, or the OOM killer will do it for you.
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 3g
+
+    # Sensible hardening for a service that executes customer-supplied
+    # HTML/JS. Chromium's own sandbox is off (containers do not grant it the
+    # privileges it needs), so the container boundary is the real one.
+    security_opt:
+      - no-new-privileges:true
