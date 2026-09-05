@@ -33,6 +33,18 @@ services:
       MAX_CONCURRENCY_PER_INSTANCE: "6"
       LOG_LEVEL: info
       SHUTDOWN_GRACE: 5s
+      # API key auth is required — the process will not start without either
+      # API_KEYS or AUTH_DISABLED=true. Supply the real value from a secret,
+      # not committed here.
+      API_KEYS: ${API_KEYS:?set API_KEYS to a long random secret}
+      # Deployment render defaults (mirrors pdf-service-saas for Synectus
+      # Medico); a request's `options` object overrides these per call.
+      PDF_DEFAULT_PAPER: Letter
+      PDF_DEFAULT_MARGIN_TOP: "0"
+      PDF_DEFAULT_MARGIN_RIGHT: "0"
+      PDF_DEFAULT_MARGIN_BOTTOM: 10mm
+      PDF_DEFAULT_MARGIN_LEFT: "0"
+      PDF_DEFAULT_PRINT_BACKGROUND: "true"
 
     # Liveness-style check: is the process itself answering? It deliberately
     # probes /livez, not /readyz — /readyz reports "not ready" while draining

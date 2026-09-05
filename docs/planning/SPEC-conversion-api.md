@@ -174,3 +174,85 @@ None blocking v1 as scoped above. Deferred, with reasoning recorded above (not s
 `Idempotency-Key` enforcement (needs `storage-and-delivery`'s persistence), sandbox/test mode (needs
 `customization-layer`'s watermark slice), async job-id + webhook dispatch (needs
 `storage-and-delivery`), API-key auth and rate limiting (`auth-and-tenancy`, a separate module).
+
+---
+
+## v2 — options envelope (Synectus Medico integration)
+
+Added so `pdf-service-saas` (Node/Puppeteer) can be replaced by this service without a rendering
+regression. v1 deliberately hard-coded `renderengines.DefaultRenderOptions()` for every request
+(A4, 0.4in margins, no header/footer) and said the real options schema was this module's job "once
+it exists." This is that schema.
+
+### Request shape
+
+`options` is a third optional key alongside `content` and `payload`. Every field is optional;
+an absent field falls back to the **deployment default** (`PDF_DEFAULT_*` env → `WithRenderDefaults`),
+which itself falls back to `DefaultRenderOptions`. A request sending only `{content}` is byte-for-byte
+unaffected.
+
+```jsonc
+{
+  "content": "...", "payload": { }?,
+  "options": {
+    "paperSize": "Letter|Legal|Tabloid|A3|A4|A5",   // OR width+height, not both
+    "width": "8.5in", "height": "11in",              // number = inches, or "10mm"/"1cm"/"72pt"/"96px"
+    "landscape": false,
+    "margin": { "top": "0", "right": "0", "bottom": "10mm", "left": "0" },
+    "scale": 1.0,                                     // 0.1–2.0
+    "printBackground": true,
+    "displayHeaderFooter": false,
+    "headerTemplate": "<div>…</div>", "footerTemplate": "<div>…</div>",
+    "waitForFonts": true, "waitForImages": true,
+    "timeoutMs": 30000,                               // clamped to [1000, 120000]
+    "embedImages": false,                             // /v1/pdf/html only; requires EMBED_IMAGES_ENABLED
+    "fitToPage": false                                // /v1/pdf/html only
+  }
+}
+```
+
+### `fitToPage`
+
+Single-page fit: the content's natural height is measured (in the same tab, at a layout viewport
+equal to the print page width) and, if it exceeds the printable page height implied by paper +
+margins, Chromium's own `PrintToPDF` scale is set to shrink it — clamped at a `MinFitScale` (0.6)
+readability floor. On the floor, one page is still produced and overflow is flagged. Ports
+`pdf-service-saas`'s `fitToPage`; the scale actually applied travels back in response **headers**
+(`X-Fit-Scale`, `X-Fit-Overflow`) since the success body is raw PDF bytes, not JSON.
+
+`renderengines` gains `RenderHTMLFitted` / `Pool.RenderHTMLFitted` (additive — `RenderHTML` and
+its tests are untouched) returning `FittedRender{PDF, Scale, Overflowed}`.
+
+### `embedImages`
+
+Ports `pdf-service-saas`'s `embedImagesAsBase64`: remote `<img src>` are fetched server-side and
+inlined as `data:` URIs before rendering, so a slow/expired signed URL can't stall or fail the
+render. It is doubly gated — the request must ask (`options.embedImages`) **and** the deployment
+must allow it (`EMBED_IMAGES_ENABLED=true`) — because fetching URLs named in a submitted document
+is SSRF surface. `internal/assets` refuses any URL that resolves to a loopback/private/link-local
+address unless `EMBED_IMAGES_ALLOW_PRIVATE=true`, supports a host allow-list, caps per-image and
+total bytes, and never fails the render for an image that can't be fetched (the URL is left as-is).
+
+For Synectus Medico specifically this is optional: every image in its report/intake HTML is
+already an absolute signed-S3 URL or a `data:` URI, which Chromium fetches directly — `embedImages`
+is a latency/resilience nicety, not a correctness requirement.
+
+### Error code additions
+
+| Code | Status | When |
+|---|---|---|
+| `INVALID_REQUEST` | 400 | unknown `paperSize`, `scale` out of range, `width`/`height` not paired, a length that doesn't parse, `fitToPage`/`embedImages` on a non-HTML route, `embedImages` when the server hasn't enabled it |
+
+(No new top-level code — an unusable options object is a caller-side mistake, same class as a
+malformed body.)
+
+### Route support matrix
+
+| Option group | `/v1/pdf/html` | `/v1/pdf/markdown` | `/v1/pdf/html-lite` |
+|---|---|---|---|
+| paper / margin / scale / header-footer / wait / timeout | ✅ | ✅ | timeout only (WeasyPrint has no page-setup concept) |
+| `fitToPage` | ✅ | ✗ 400 | ✗ 400 |
+| `embedImages` | ✅ (if enabled) | ✗ 400 | ✗ 400 |
+
+`fitToPage` and `embedImages` are HTML-only for a structural reason: there is no DOM to measure,
+and no `<img>` tag to rewrite, before goldmark runs on the markdown path.

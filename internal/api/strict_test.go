@@ -170,6 +170,9 @@ func (echoingFakeRenderer) RenderHTML(_ context.Context, html string, _ renderen
 func (echoingFakeRenderer) RenderMarkdown(_ context.Context, markdown string, _ renderengines.RenderOptions) ([]byte, error) {
 	return []byte("%PDF-1.4 " + markdown), nil
 }
+func (echoingFakeRenderer) RenderHTMLFitted(_ context.Context, html string, _ renderengines.RenderOptions) (renderengines.FittedRender, error) {
+	return renderengines.FittedRender{PDF: []byte("%PDF-1.4 " + html), Scale: 1}, nil
+}
 
 type echoingFakeStaticRenderer struct{}
 

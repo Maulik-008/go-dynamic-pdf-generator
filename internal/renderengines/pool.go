@@ -300,6 +300,20 @@ func (p *Pool) RenderMarkdown(ctx context.Context, markdown string, opts RenderO
 	return pdf, err
 }
 
+// RenderHTMLFitted dispatches to one instance in the pool, same as
+// RenderHTML — see Renderer.RenderHTMLFitted.
+func (p *Pool) RenderHTMLFitted(ctx context.Context, html string, opts RenderOptions) (FittedRender, error) {
+	slot, r, release, err := p.acquire(ctx)
+	if err != nil {
+		return FittedRender{}, err
+	}
+	defer release()
+	res, err := r.RenderHTMLFitted(ctx, html, opts)
+	err = classifyRenderErr(r, err)
+	slot.noteRenderOutcome(err)
+	return res, err
+}
+
 // MeasureHTMLHeight dispatches to one instance in the pool, same as
 // RenderHTML — see Renderer.MeasureHTMLHeight.
 func (p *Pool) MeasureHTMLHeight(ctx context.Context, htmlFragment string, viewportWidthPx int64) (float64, error) {

@@ -32,6 +32,11 @@ before running the server. Here is the full, honest list:
 | Variable | Required? | Default if not set | What it controls |
 |---|---|---|---|
 | `CHROMIUM_PATH` | **Yes** | *(server refuses to start without it)* | Full path to your Chromium/Chrome/`chrome-headless-shell` binary |
+| `API_KEYS` | **Yes** *(unless `AUTH_DISABLED=true`)* | *(server refuses to start)* | Comma-separated API keys. Callers send one via `X-API-Key` or `Authorization: Bearer`. Health probes are exempt |
+| `AUTH_DISABLED` | No | `false` | Set to `true` to run with no key check — local development only |
+| `PDF_DEFAULT_PAPER` | No | `A4` | Deployment-wide default paper size (`Letter`, `Legal`, `A4`, …); a request's `options` overrides it |
+| `PDF_DEFAULT_MARGIN_TOP` / `_RIGHT` / `_BOTTOM` / `_LEFT` | No | `0.4in` | Deployment-wide default margins (`0`, `10mm`, `0.5in`, …) |
+| `EMBED_IMAGES_ENABLED` | No | `false` | Allow `options.embedImages` (fetch + inline remote `<img>` server-side) |
 | `PORT` | No | `8080` | Which port the HTTP server listens on |
 | `POOL_SIZE` | No | `2` | How many Chromium browser processes stay warm and ready |
 | `MAX_CONCURRENCY_PER_INSTANCE` | No | `6` | How many PDF jobs one Chromium instance handles at the same time |
@@ -92,11 +97,15 @@ Now try generating a real PDF:
 ```bash
 curl -X POST http://localhost:8080/v1/pdf/html \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: <one of your API_KEYS>" \
   -d '{"content":"<html><body><h1>Hello, my first PDF!</h1></body></html>"}' \
   --output test.pdf
 
 file test.pdf
 ```
+
+(Without the key you get `401 {"error":{"code":"UNAUTHORIZED",...}}`. For local
+development you can instead start the server with `AUTH_DISABLED=true`.)
 
 If `file test.pdf` says something like `PDF document, version 1.4`, congratulations — it worked.
 
@@ -153,11 +162,12 @@ processes eating memory in the background.
 
 ## Cons / current limitations (be aware before using in production)
 
-- **No login or API key system yet** — the server, as it stands, trusts every request that reaches
-  it. You must put it behind your own authentication (or keep it on a private/internal network) —
-  never expose it directly to the public internet as-is.
-- **No usage tracking or rate limiting** — anyone (or anything) that can reach it can generate as
-  many PDFs as they want, as fast as they want, up to the server's own queue limits.
+- **API key auth is basic** — one or more shared static keys (`API_KEYS`), checked in constant
+  time on every conversion endpoint. There are no per-key scopes, no per-key rate limits, and no
+  usage metering yet (see `docs/planning/SPEC-auth-and-tenancy.md`). Still keep it on a
+  private/internal network; do not expose it directly to the public internet.
+- **No usage tracking or per-key rate limiting** — a valid key can generate as many PDFs as it
+  wants, as fast as it wants, up to the server's own global queue limit.
 - **No background/async jobs** — every request waits for the PDF to finish generating right there
   and then. There's no "submit now, get notified later" mode for very large batches yet.
 - **No file storage built in** — you get the PDF bytes back immediately; if you want to keep a copy

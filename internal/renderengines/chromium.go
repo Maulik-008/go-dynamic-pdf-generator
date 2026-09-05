@@ -8,6 +8,7 @@ package renderengines
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"time"
 
@@ -168,16 +169,7 @@ func (r *Renderer) RenderHTML(ctx context.Context, html string, opts RenderOptio
 	var pdfBuf []byte
 	err := chromedp.Run(taskCtx,
 		chromedp.Navigate("about:blank"),
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			frameTree, err := page.GetFrameTree().Do(ctx)
-			if err != nil {
-				return fmt.Errorf("get frame tree: %w", err)
-			}
-			if err := page.SetDocumentContent(frameTree.Frame.ID, html).Do(ctx); err != nil {
-				return fmt.Errorf("set document content: %w", err)
-			}
-			return nil
-		}),
+		injectDocument(html),
 		chromedp.WaitReady("body", chromedp.ByQuery),
 		waitForLoad(opts),
 		printToPDF(opts, &pdfBuf),
@@ -187,6 +179,122 @@ func (r *Renderer) RenderHTML(ctx context.Context, html string, opts RenderOptio
 	}
 	return pdfBuf, nil
 }
+
+// FittedRender is the result of a "fit to page" render: the PDF, plus the
+// print scale that was actually applied to make the content fit on a single
+// page and whether the content still overflowed even at MinFitScale.
+type FittedRender struct {
+	PDF []byte
+	// Scale is 1.0 when the content already fit, or a value in
+	// [MinFitScale, 1.0) when it had to be shrunk.
+	Scale float64
+	// Overflowed is true when the exact scale needed was below MinFitScale:
+	// one page is still produced, at MinFitScale, so a caller can warn the
+	// author rather than silently emitting an unreadable page.
+	Overflowed bool
+}
+
+const (
+	// MinFitScale is the readability floor for RenderHTMLFitted. Matches
+	// pdf-service-saas's MIN_FIT_SCALE — an unclamped fit would happily
+	// render a long legal document at 25% with no signal to anyone.
+	MinFitScale = 0.6
+
+	// cssPxPerInch converts the inch-based paper/margin figures in
+	// RenderOptions to the CSS pixels document.body.scrollHeight is
+	// reported in.
+	cssPxPerInch = 96
+)
+
+// RenderHTMLFitted renders html to a single page, scaling the content down
+// uniformly if its natural height exceeds the printable page height implied
+// by opts (paper size minus top/bottom margins, orientation-aware).
+//
+// It is Chromium's own PrintToPDF `scale` that is used, not a CSS transform:
+// a CSS `transform: scale()` is paint-only and never changes print
+// pagination, whereas PrintToPDF scale changes how many CSS pixels fit on a
+// physical page without reflowing text. This mirrors the approach proven in
+// pdf-service-saas/services/pdfGenerator.js.
+//
+// The natural height is measured in the same tab, at a layout viewport equal
+// to the print page width, so the measurement reflects the same wrapping the
+// print will use.
+func (r *Renderer) RenderHTMLFitted(ctx context.Context, html string, opts RenderOptions) (FittedRender, error) {
+	opts = opts.withDefaults()
+
+	taskCtx, taskCancel := chromedp.NewContext(r.browserCtx)
+	defer taskCancel()
+
+	taskCtx, timeoutCancel := context.WithTimeout(taskCtx, opts.Timeout)
+	defer timeoutCancel()
+	// also honor the caller's own context, independent of opts.Timeout
+	taskCtx, callerCancel := context.WithCancel(taskCtx)
+	defer callerCancel()
+	go func() {
+		select {
+		case <-ctx.Done():
+			callerCancel()
+		case <-taskCtx.Done():
+		}
+	}()
+
+	// Orientation-aware page box. In landscape PrintToPDF rotates the paper,
+	// so the long edge (PaperHeight) becomes the width and the short edge
+	// (PaperWidth) the height; top/bottom margins always apply to the final
+	// orientation.
+	pageWidthIn, pageHeightIn := opts.PaperWidth, opts.PaperHeight
+	if opts.Landscape {
+		pageWidthIn, pageHeightIn = opts.PaperHeight, opts.PaperWidth
+	}
+	viewportWidthPx := int64(math.Round(pageWidthIn * cssPxPerInch))
+	availableHeightPx := (pageHeightIn - opts.MarginTop - opts.MarginBottom) * cssPxPerInch
+
+	scale := 1.0
+	overflowed := false
+	var pdfBuf []byte
+	err := chromedp.Run(taskCtx,
+		chromedp.EmulateViewport(viewportWidthPx, 1000),
+		chromedp.Navigate("about:blank"),
+		injectDocument(html),
+		chromedp.WaitReady("body", chromedp.ByQuery),
+		waitForLoad(opts),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			var natural float64
+			if err := chromedp.Evaluate(naturalHeightJS, &natural).Do(ctx); err != nil {
+				return fmt.Errorf("measure content height: %w", err)
+			}
+			if availableHeightPx > 0 && natural > availableHeightPx {
+				exact := availableHeightPx / natural
+				if exact < MinFitScale {
+					scale, overflowed = MinFitScale, true
+				} else {
+					scale = exact
+				}
+			}
+			fitted := opts
+			fitted.Scale = scale
+			data, _, err := printToPDFParams(fitted).Do(ctx)
+			if err != nil {
+				return fmt.Errorf("print to pdf: %w", err)
+			}
+			pdfBuf = data
+			return nil
+		}),
+	)
+	if err != nil {
+		return FittedRender{}, fmt.Errorf("renderengines: render html fitted: %w", err)
+	}
+	return FittedRender{PDF: pdfBuf, Scale: scale, Overflowed: overflowed}, nil
+}
+
+// naturalHeightJS reports the unscaled content height of the current
+// document, taking the largest of the usual four measures so a document
+// that sizes itself via <html> rather than <body> (or vice versa) is still
+// measured correctly. Matches the measurement pdf-service-saas takes.
+const naturalHeightJS = `Math.max(
+	document.body.scrollHeight, document.body.offsetHeight,
+	document.documentElement.scrollHeight, document.documentElement.offsetHeight
+)`
 
 // measureHeightTimeout bounds MeasureHTMLHeight — it has no opts.Timeout of
 // its own (it's not a RenderOptions-shaped call), so a fixed, generous
@@ -246,16 +354,7 @@ func (r *Renderer) MeasureHTMLHeight(ctx context.Context, htmlFragment string, v
 	err := chromedp.Run(taskCtx,
 		chromedp.EmulateViewport(viewportWidthPx, 1000),
 		chromedp.Navigate("about:blank"),
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			frameTree, err := page.GetFrameTree().Do(ctx)
-			if err != nil {
-				return fmt.Errorf("get frame tree: %w", err)
-			}
-			if err := page.SetDocumentContent(frameTree.Frame.ID, content).Do(ctx); err != nil {
-				return fmt.Errorf("set document content: %w", err)
-			}
-			return nil
-		}),
+		injectDocument(content),
 		chromedp.WaitReady("body", chromedp.ByQuery),
 		chromedp.Evaluate(`document.fonts.ready`, nil,
 			func(p *runtime.EvaluateParams) *runtime.EvaluateParams {
@@ -309,23 +408,45 @@ const imagesLoadedJS = `new Promise((resolve) => {
 	});
 })`
 
+// injectDocument replaces the current about:blank document with html. Used
+// instead of navigating to a data: URL so an arbitrarily large document is
+// not subject to URL-length limits. Shared by every render/measure path so
+// they all inject content the same way.
+func injectDocument(html string) chromedp.Action {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		frameTree, err := page.GetFrameTree().Do(ctx)
+		if err != nil {
+			return fmt.Errorf("get frame tree: %w", err)
+		}
+		if err := page.SetDocumentContent(frameTree.Frame.ID, html).Do(ctx); err != nil {
+			return fmt.Errorf("set document content: %w", err)
+		}
+		return nil
+	})
+}
+
+// printToPDFParams builds the CDP PrintToPDF parameters from opts. Split out
+// from printToPDF so RenderHTMLFitted can invoke the print step directly
+// after computing its scale, without a second Chromium round trip.
+func printToPDFParams(opts RenderOptions) *page.PrintToPDFParams {
+	return page.PrintToPDF().
+		WithLandscape(opts.Landscape).
+		WithPrintBackground(opts.PrintBackground).
+		WithScale(opts.Scale).
+		WithPaperWidth(opts.PaperWidth).
+		WithPaperHeight(opts.PaperHeight).
+		WithMarginTop(opts.MarginTop).
+		WithMarginBottom(opts.MarginBottom).
+		WithMarginLeft(opts.MarginLeft).
+		WithMarginRight(opts.MarginRight).
+		WithDisplayHeaderFooter(opts.DisplayHeaderFooter).
+		WithHeaderTemplate(opts.HeaderTemplate).
+		WithFooterTemplate(opts.FooterTemplate)
+}
+
 func printToPDF(opts RenderOptions, out *[]byte) chromedp.Action {
 	return chromedp.ActionFunc(func(ctx context.Context) error {
-		params := page.PrintToPDF().
-			WithLandscape(opts.Landscape).
-			WithPrintBackground(opts.PrintBackground).
-			WithScale(opts.Scale).
-			WithPaperWidth(opts.PaperWidth).
-			WithPaperHeight(opts.PaperHeight).
-			WithMarginTop(opts.MarginTop).
-			WithMarginBottom(opts.MarginBottom).
-			WithMarginLeft(opts.MarginLeft).
-			WithMarginRight(opts.MarginRight).
-			WithDisplayHeaderFooter(opts.DisplayHeaderFooter).
-			WithHeaderTemplate(opts.HeaderTemplate).
-			WithFooterTemplate(opts.FooterTemplate)
-
-		data, _, err := params.Do(ctx)
+		data, _, err := printToPDFParams(opts).Do(ctx)
 		if err != nil {
 			return fmt.Errorf("print to pdf: %w", err)
 		}
