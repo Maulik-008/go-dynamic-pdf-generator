@@ -242,3 +242,13 @@ confirm.
 Measured throughput on a 4-core box: **~26-27 heavy 3-page renders/second**
 with zero failures. See `docs/research/load-test-results.md` for the methodology
 and the raw numbers.
+
+## 9. A concrete EC2 runbook
+
+`08-ec2-deployment-alongside-node.md` is a copy-pasteable, step-by-step guide
+for the specific case of adding this service to an EC2 host that **already runs
+a Node PDF service** (pm2, its own nginx block): install Go 1.26 + Chromium,
+build the binary, install the systemd unit from `deploy/systemd/`, add the
+nginx server block from `deploy/nginx/`, issue TLS with certbot, cut
+`saas-backend` over with one env change, and roll back the same way. It also
+covers the `.github/workflows/deploy.yml` push-to-`main` automation.

@@ -1,0 +1,67 @@
+# Deploy go-dynamic-pdf-generator to the EC2 host on push to main.
+#
+# Mirrors the Node PDF service's deploy workflow (SSH in, pull, build,
+# restart) but drives a systemd unit instead of pm2, because this is a
+# compiled Go binary, not a Node app.
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   EC2_SSH_KEY   private key whose public half is in ubuntu@<host>:~/.ssh/authorized_keys
+#   EC2_HOST      the EC2 public DNS / IP
+#   EC2_USER      usually "ubuntu"
+#
+# One-time host setup is in docs/guides/08-ec2-deployment-alongside-node.md.
+# This workflow assumes that has already been done: the repo is cloned at
+# ~/go-dynamic-pdf-generator, Go is on PATH for the deploy user, and the
+# systemd unit go-dynamic-pdf-generator is installed and enabled.
+
+name: Deploy go-dynamic-pdf-generator to EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-ec2
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy
+        run: |
+          ssh "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" bash -se <<'EOF'
+          set -euo pipefail
+          export PATH=$PATH:/usr/local/go/bin
+
+          cd ~/go-dynamic-pdf-generator || { echo "repo not found — run one-time host setup first"; exit 2; }
+
+          git fetch --prune origin
+          git checkout main
+          git reset --hard origin/main
+
+          # Build to a temp path, then swap — a failed build never replaces a
+          # working binary.
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/pdfsvc.new ./cmd/api
+          sudo install -m 0755 /tmp/pdfsvc.new /usr/local/bin/pdfsvc
+          rm -f /tmp/pdfsvc.new
+
+          sudo systemctl restart go-dynamic-pdf-generator
+
+          # Wait for readiness, fail the deploy if it never comes up.
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8080/readyz; then
+              echo "service healthy after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "service did not become ready in 30s"; sudo systemctl --no-pager status go-dynamic-pdf-generator; exit 1
+          EOF
