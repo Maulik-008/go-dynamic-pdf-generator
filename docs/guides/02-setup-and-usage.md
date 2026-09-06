@@ -90,7 +90,10 @@ up monitoring:
   as an alias of this for backwards compatibility.
 
 For deploying with auto-restart, health probes, and multiple replicas, see
-`04-deployment.md`.
+`04-deployment.md`. For a concrete, step-by-step EC2 runbook that stands this
+service up **next to an existing Node PDF service** on the same host (own
+systemd unit, own nginx subdomain, backend cutover), see
+`08-ec2-deployment-alongside-node.md`.
 
 Now try generating a real PDF:
 

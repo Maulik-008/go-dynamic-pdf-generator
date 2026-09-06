@@ -25,7 +25,8 @@ point to re-verify on your own box with the commands given, not as guaranteed co
 
 | Your situation | What this guide tells you to do |
 |---|---|
-| VM has ~2GB RAM or less | `POOL_SIZE=1`, `MAX_CONCURRENCY_PER_INSTANCE=2` — see §3 |
+| VM has ~1GB RAM (and shares it with other services) | `POOL_SIZE=1`, `MAX_CONCURRENCY_PER_INSTANCE=1`, **3GB swap**, `MemoryMax=780M`, build off-box. You cannot also run the old Node/Chromium PDF service — this must be a straight replacement. See §3.1 and `08-ec2-deployment-alongside-node.md` §0.5. Resizing to 2GB is strongly recommended. |
+| VM has ~2GB RAM | `POOL_SIZE=1`, `MAX_CONCURRENCY_PER_INSTANCE=2` — see §3 |
 | VM has 4GB+ RAM | `POOL_SIZE=2`, can raise concurrency — see §3 |
 | Old Node.js/Puppeteer service still running | Don't stop it yet — validate the new service side-by-side first (§2, §6) |
 | Need to free disk space | §2.3 |
@@ -155,10 +156,20 @@ The two settings that matter most, and the reasoning behind them:
 
 | Your VM's total RAM | `POOL_SIZE` | `MAX_CONCURRENCY_PER_INSTANCE` | Rough headroom left for OS |
 |---|---|---|---|
+| ~1GB (dedicated to this service) | `1` | `1` | ~200–300MB + **3GB swap required** |
 | ~2GB | `1` | `2` | ~1.1–1.3GB |
 | ~4GB | `2` | `4` | ~1.5–2GB |
 | ~8GB | `3` | `6` (default) | ~4GB+ |
 | 16GB+ | `runtime.NumCPU() - 1` | `6` (default) | plenty |
+
+**At 1GB** the box has room for *one* Chromium and nothing else Chromium-based
+— so it must be the only PDF service on it (retire the Node one), it must have
+swap (a heavy render briefly needs ~500–800MB, more than the box has free), and
+`MAX_CONCURRENCY_PER_INSTANCE` must be `1` so two heavy renders never overlap.
+`MemoryMax=780M` + `MemoryHigh=680M` in the unit make systemd throttle/kill
+this cgroup on a leak instead of the kernel OOM-killer hitting `sshd`.
+Throughput is ~2–4 heavy reports/minute, serialized — fine for interactive use,
+not for batch. Prefer resizing to 2GB.
 
 Don't set `MAX_CONCURRENCY_PER_INSTANCE` high on a small VM even though it doesn't change
 `POOL_SIZE` — each concurrent render opens another browser tab, which costs its own memory on top
