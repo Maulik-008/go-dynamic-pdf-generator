@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Maulik-zuru/great-pdf-generator/internal/lightrender"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/renderengines"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/lightrender"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
 )
 
 // TestDecodeConversionRequest_BodyOneByteOverLimitRejected and its sibling
@@ -169,6 +169,9 @@ func (echoingFakeRenderer) RenderHTML(_ context.Context, html string, _ renderen
 }
 func (echoingFakeRenderer) RenderMarkdown(_ context.Context, markdown string, _ renderengines.RenderOptions) ([]byte, error) {
 	return []byte("%PDF-1.4 " + markdown), nil
+}
+func (echoingFakeRenderer) RenderHTMLFitted(_ context.Context, html string, _ renderengines.RenderOptions) (renderengines.FittedRender, error) {
+	return renderengines.FittedRender{PDF: []byte("%PDF-1.4 " + html), Scale: 1}, nil
 }
 
 type echoingFakeStaticRenderer struct{}

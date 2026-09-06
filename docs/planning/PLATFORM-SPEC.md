@@ -311,6 +311,10 @@ per the Round 1 decision above.
 8. **Image → PDF + PDF manipulation (fast path)** — `pdfcpu`/`fpdf`, no browser. This was originally
    proposed as the very first phase (zero browser dependency, fastest to something real); it's
    still low-effort and high-value, just no longer first, per the Round 1 priority decision.
+   *Partially anticipated:* `options.overlay` (see `SPEC-conversion-api.md`) already pulls in
+   `pdfcpu` for one narrow in-process stamp operation — rendered-fragment-onto-selected-pages — so
+   the disclaimer-overlay logic could move off `saas-backend`. The full image/merge/split/encrypt
+   surface is still this phase's job.
 9. **Template designer Tier 2/3** — only if usage signal after step 4–8 justifies it, per the
    Visual Template Designer section above.
 

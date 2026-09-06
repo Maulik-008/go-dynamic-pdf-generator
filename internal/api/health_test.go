@@ -7,8 +7,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/Maulik-zuru/great-pdf-generator/internal/orchestration"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/renderengines"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/orchestration"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
 )
 
 // fakePoolHealth reports whatever pool state a test wants, so health

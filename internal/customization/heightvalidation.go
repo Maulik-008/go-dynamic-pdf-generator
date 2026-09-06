@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/Maulik-zuru/great-pdf-generator/internal/renderengines"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
 )
 
 // pxPerInch is the reference DPI used to convert the CSS-pixel heights

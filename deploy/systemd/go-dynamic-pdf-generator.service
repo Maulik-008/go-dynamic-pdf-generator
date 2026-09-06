@@ -1,4 +1,4 @@
-# systemd unit for great-pdf-generator.
+# systemd unit for go-dynamic-pdf-generator.
 #
 # NOT RUN IN THE ENVIRONMENT WHERE IT WAS WRITTEN — systemd is not PID 1
 # there, so this unit has never actually been started. Reviewed, not
@@ -6,15 +6,15 @@
 # docs/guides/04-deployment.md before relying on it.
 #
 # Install:
-#   sudo cp deploy/systemd/great-pdf-generator.service /etc/systemd/system/
-#   sudo cp deploy/systemd/great-pdf-generator.env /etc/great-pdf-generator.env
-#   sudo useradd --system --home /var/lib/great-pdf-generator --create-home pdfsvc
+#   sudo cp deploy/systemd/go-dynamic-pdf-generator.service /etc/systemd/system/
+#   sudo cp deploy/systemd/go-dynamic-pdf-generator.env /etc/go-dynamic-pdf-generator.env
+#   sudo useradd --system --home /var/lib/go-dynamic-pdf-generator --create-home pdfsvc
 #   sudo install -m755 pdfsvc /usr/local/bin/pdfsvc
-#   sudo systemctl daemon-reload && sudo systemctl enable --now great-pdf-generator
+#   sudo systemctl daemon-reload && sudo systemctl enable --now go-dynamic-pdf-generator
 
 [Unit]
-Description=great-pdf-generator (HTML/Markdown to PDF service)
-Documentation=https://github.com/Maulik-zuru/great-pdf-generator
+Description=go-dynamic-pdf-generator (HTML/Markdown to PDF service)
+Documentation=https://github.com/Maulik-008/go-dynamic-pdf-generator
 After=network-online.target
 Wants=network-online.target
 
@@ -22,7 +22,7 @@ Wants=network-online.target
 Type=exec
 User=pdfsvc
 Group=pdfsvc
-EnvironmentFile=/etc/great-pdf-generator.env
+EnvironmentFile=/etc/go-dynamic-pdf-generator.env
 ExecStart=/usr/local/bin/pdfsvc
 
 # The auto-restart this service does not provide for itself. RestartSec
@@ -66,8 +66,8 @@ RestrictRealtime=true
 LockPersonality=true
 
 # Chromium needs a writable home for its profile/cache.
-StateDirectory=great-pdf-generator
-Environment=HOME=/var/lib/great-pdf-generator
+StateDirectory=go-dynamic-pdf-generator
+Environment=HOME=/var/lib/go-dynamic-pdf-generator
 
 # Chromium legitimately needs a large shared-memory area; too small a
 # /dev/shm is a known cause of renderer crashes on bigger documents.

@@ -14,14 +14,17 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"sync/atomic"
 
-	"github.com/Maulik-zuru/great-pdf-generator/internal/customization"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/lightrender"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/orchestration"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/renderengines"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/assets"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/customization"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/lightrender"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/orchestration"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/overlay"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
 )
 
 // maxBodyBytes is a conservative placeholder ceiling for this slice.
@@ -40,6 +43,7 @@ const queueFullRetryAfterSeconds = "1"
 type pdfRenderer interface {
 	RenderHTML(ctx context.Context, html string, opts renderengines.RenderOptions) ([]byte, error)
 	RenderMarkdown(ctx context.Context, markdown string, opts renderengines.RenderOptions) ([]byte, error)
+	RenderHTMLFitted(ctx context.Context, html string, opts renderengines.RenderOptions) (renderengines.FittedRender, error)
 }
 
 // staticPdfRenderer is satisfied by *lightrender.Renderer — kept as its own,
@@ -72,6 +76,17 @@ type Server struct {
 	// readiness simply omits the chromium block rather than inventing one.
 	renderPool renderPoolHealth
 
+	// renderDefaults is the deployment-level base every request's options
+	// object is layered on top of (see options.go). Defaults to
+	// renderengines.DefaultRenderOptions; overridden by WithRenderDefaults.
+	renderDefaults renderengines.RenderOptions
+
+	// imageEmbedding, when non-nil, allows options.embedImages to inline
+	// remote <img> sources server-side before rendering. nil means the
+	// feature is off and such a request is rejected — fetching URLs named in
+	// a submitted document is SSRF surface and stays opt-in per deployment.
+	imageEmbedding *assets.Config
+
 	// shuttingDown makes readiness fail as soon as graceful shutdown starts,
 	// so a load balancer drains this instance before in-flight work is
 	// finished. Liveness deliberately stays up throughout.
@@ -88,6 +103,21 @@ type ServerOption func(*Server)
 // readiness probe.
 func WithRenderPoolHealth(p renderPoolHealth) ServerOption {
 	return func(s *Server) { s.renderPool = p }
+}
+
+// WithRenderDefaults sets the deployment-level base render options that a
+// request's options object is layered on top of. Typically built from the
+// PDF_DEFAULT_* env vars in cmd/api. Fields left at their
+// DefaultRenderOptions value are unaffected.
+func WithRenderDefaults(d renderengines.RenderOptions) ServerOption {
+	return func(s *Server) { s.renderDefaults = d }
+}
+
+// WithImageEmbedding enables options.embedImages: remote <img> sources are
+// fetched and inlined server-side before rendering, using cfg. Off unless
+// called, because it is SSRF surface (see internal/assets).
+func WithImageEmbedding(cfg assets.Config) ServerOption {
+	return func(s *Server) { s.imageEmbedding = &cfg }
 }
 
 // BeginShutdown marks this instance as draining: readiness starts failing
@@ -108,6 +138,7 @@ func NewServer(renderer pdfRenderer, staticRenderer staticPdfRenderer, jobPool, 
 		staticRenderer: staticRenderer,
 		jobPool:        jobPool,
 		staticJobPool:  staticJobPool,
+		renderDefaults: renderengines.DefaultRenderOptions(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -145,10 +176,13 @@ func (s *Server) Routes() http.Handler {
 // conversionRequest is the single request shape every conversion endpoint
 // accepts. Payload is optional: when present, Content is treated as a
 // template and merged via customization.Merge before rendering; when
-// absent, Content is rendered as-is. See docs/planning/SPEC-conversion-api.md.
+// absent, Content is rendered as-is. Options is optional: it carries page
+// setup / wait strategy / engine switches (see options.go). See
+// docs/planning/SPEC-conversion-api.md.
 type conversionRequest struct {
 	Content string         `json:"content"`
 	Payload map[string]any `json:"payload,omitempty"`
+	Options *optionsInput  `json:"options,omitempty"`
 }
 
 // errorEnvelope is the single error shape every conversion endpoint
@@ -261,35 +295,147 @@ func writePDF(w http.ResponseWriter, pdf []byte) {
 	w.Write(pdf)
 }
 
+// routeCaps says which engine-adjacent options a route supports. embedImages
+// and fitToPage are HTML-only: fitToPage measures a rendered DOM (there is
+// no DOM before goldmark runs on the markdown path), and embedImages
+// rewrites <img> tags that markdown image syntax hasn't produced yet.
+// overlay is HTML-only for the same structural reason as fitToPage plus a
+// practical one — it is a Chromium-rendered composition step, and the
+// markdown and WeasyPrint paths have no equivalent notion.
+type routeCaps struct {
+	allowEmbedImages bool
+	allowFitToPage   bool
+	allowOverlay     bool
+}
+
+// gatedHTMLRenderer adapts the server's renderer + job pool to
+// overlay.FragmentRenderer, so the overlay fragment render passes through
+// the same admission control as any other Chromium render. It is called
+// only after the main render's own Submit has returned, never nested
+// inside it, so the two renders take an admission slot one at a time
+// rather than deadlocking a saturated pool.
+type gatedHTMLRenderer struct{ s *Server }
+
+func (g gatedHTMLRenderer) RenderHTML(ctx context.Context, html string, opts renderengines.RenderOptions) ([]byte, error) {
+	return submit(ctx, g.s.jobPool, func(ctx context.Context) ([]byte, error) {
+		return g.s.renderer.RenderHTML(ctx, html, opts)
+	})
+}
+
+// maybeOverlay applies spec to pdf when one was requested, returning pdf
+// unchanged otherwise. base is the fully-resolved render options for the
+// main document — the fragment is rendered at the same page size and
+// orientation.
+func (s *Server) maybeOverlay(ctx context.Context, pdf []byte, spec *overlay.Spec, base renderengines.RenderOptions) ([]byte, error) {
+	if spec == nil {
+		return pdf, nil
+	}
+	return overlay.Apply(ctx, gatedHTMLRenderer{s}, pdf, *spec, base)
+}
+
+// prepareRender runs the shared front half of every Chromium-backed route:
+// decode -> resolve options against the deployment defaults -> merge the
+// payload -> (optionally) inline remote images. On any failure it has
+// already written the error envelope and returns ok=false. overlaySpec is
+// non-nil only when the request asked for one and the route allows it.
+func (s *Server) prepareRender(w http.ResponseWriter, r *http.Request, caps routeCaps) (content string, opts renderengines.RenderOptions, fitToPage bool, overlaySpec *overlay.Spec, ok bool) {
+	req, ok := decodeConversionRequest(w, r)
+	if !ok {
+		return "", opts, false, nil, false
+	}
+
+	opts, embedImages, fitToPage, err := req.Options.resolve(s.renderDefaults)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return "", opts, false, nil, false
+	}
+	if fitToPage && !caps.allowFitToPage {
+		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "options.fitToPage is only supported on /v1/pdf/html")
+		return "", opts, false, nil, false
+	}
+	if embedImages && !caps.allowEmbedImages {
+		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "options.embedImages is only supported on /v1/pdf/html")
+		return "", opts, false, nil, false
+	}
+
+	if req.Options != nil {
+		overlaySpec, err = req.Options.Overlay.spec()
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+			return "", opts, false, nil, false
+		}
+		if overlaySpec != nil && !caps.allowOverlay {
+			writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "options.overlay is only supported on /v1/pdf/html")
+			return "", opts, false, nil, false
+		}
+	}
+
+	content, ok = mergeIfNeeded(w, req)
+	if !ok {
+		return "", opts, false, nil, false
+	}
+
+	if embedImages {
+		if s.imageEmbedding == nil {
+			writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "options.embedImages is not enabled on this server")
+			return "", opts, false, nil, false
+		}
+		embedded, stats := assets.Embed(r.Context(), content, *s.imageEmbedding)
+		content = embedded
+		if stats.Total > 0 {
+			slog.InfoContext(r.Context(), "embedded remote images",
+				"found", stats.Total, "embedded", stats.Embedded,
+				"failed", stats.Failed, "skipped", stats.Skipped, "bytes", stats.Bytes)
+		}
+	}
+	return content, opts, fitToPage, overlaySpec, true
+}
+
 func (s *Server) handleHTML(w http.ResponseWriter, r *http.Request) {
-	s.handleConversion(w, r, s.jobPool, s.renderer.RenderHTML)
+	content, opts, fitToPage, overlaySpec, ok := s.prepareRender(w, r, routeCaps{allowEmbedImages: true, allowFitToPage: true, allowOverlay: true})
+	if !ok {
+		return
+	}
+
+	if fitToPage {
+		res, err := submit(r.Context(), s.jobPool, func(ctx context.Context) (renderengines.FittedRender, error) {
+			return s.renderer.RenderHTMLFitted(ctx, content, opts)
+		})
+		if writeRenderError(w, err) {
+			return
+		}
+		pdf, err := s.maybeOverlay(r.Context(), res.PDF, overlaySpec, opts)
+		if writeRenderError(w, err) {
+			return
+		}
+		// fitToPage returns raw PDF bytes like every other success, so the
+		// scale actually applied travels in headers rather than a JSON body.
+		w.Header().Set("X-Fit-Scale", strconv.FormatFloat(res.Scale, 'f', -1, 64))
+		w.Header().Set("X-Fit-Overflow", strconv.FormatBool(res.Overflowed))
+		writePDF(w, pdf)
+		return
+	}
+
+	pdf, err := submit(r.Context(), s.jobPool, func(ctx context.Context) ([]byte, error) {
+		return s.renderer.RenderHTML(ctx, content, opts)
+	})
+	if writeRenderError(w, err) {
+		return
+	}
+	pdf, err = s.maybeOverlay(r.Context(), pdf, overlaySpec, opts)
+	if writeRenderError(w, err) {
+		return
+	}
+	writePDF(w, pdf)
 }
 
 func (s *Server) handleMarkdown(w http.ResponseWriter, r *http.Request) {
-	s.handleConversion(w, r, s.jobPool, s.renderer.RenderMarkdown)
-}
-
-// handleConversion is the shared request lifecycle for the Chromium-backed
-// routes: decode -> optional merge -> gated render -> respond. Every
-// engine-specific route above supplies only its own render function and
-// job pool.
-func (s *Server) handleConversion(
-	w http.ResponseWriter,
-	r *http.Request,
-	pool *orchestration.Pool,
-	renderFn func(context.Context, string, renderengines.RenderOptions) ([]byte, error),
-) {
-	req, ok := decodeConversionRequest(w, r)
+	content, opts, _, _, ok := s.prepareRender(w, r, routeCaps{})
 	if !ok {
 		return
 	}
-	content, ok := mergeIfNeeded(w, req)
-	if !ok {
-		return
-	}
-
-	pdf, err := submit(r.Context(), pool, func(ctx context.Context) ([]byte, error) {
-		return renderFn(ctx, content, renderengines.DefaultRenderOptions())
+	pdf, err := submit(r.Context(), s.jobPool, func(ctx context.Context) ([]byte, error) {
+		return s.renderer.RenderMarkdown(ctx, content, opts)
 	})
 	if writeRenderError(w, err) {
 		return
@@ -298,11 +444,12 @@ func (s *Server) handleConversion(
 }
 
 // handleHTMLLite serves the separate, explicitly opt-in lightweight-render
-// (WeasyPrint, no JavaScript) path. Deliberately does not call
-// handleConversion above — same request envelope and merge behavior, but
-// the actual render call stays on its own distinct code path so a future
-// change to the Chromium route can't silently affect this one, per
-// docs/planning/SPEC-lightweight-renderer.md.
+// (WeasyPrint, no JavaScript) path. It shares the request envelope and merge
+// behavior but keeps its own render call on a distinct code path, per
+// docs/planning/SPEC-lightweight-renderer.md. Of the options envelope only
+// timeoutMs is honored here — WeasyPrint has no concept of the Chromium
+// page-setup fields, so paperSize/margin/header/footer are ignored on this
+// route rather than silently half-applied.
 func (s *Server) handleHTMLLite(w http.ResponseWriter, r *http.Request) {
 	if s.staticRenderer == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "NOT_CONFIGURED",
@@ -310,17 +457,13 @@ func (s *Server) handleHTMLLite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req, ok := decodeConversionRequest(w, r)
-	if !ok {
-		return
-	}
-	content, ok := mergeIfNeeded(w, req)
+	content, opts, _, _, ok := s.prepareRender(w, r, routeCaps{})
 	if !ok {
 		return
 	}
 
 	pdf, err := submit(r.Context(), s.staticJobPool, func(ctx context.Context) ([]byte, error) {
-		return s.staticRenderer.RenderHTML(ctx, content, lightrender.RenderOptions{})
+		return s.staticRenderer.RenderHTML(ctx, content, lightrender.RenderOptions{Timeout: opts.Timeout})
 	})
 	if writeRenderError(w, err) {
 		return

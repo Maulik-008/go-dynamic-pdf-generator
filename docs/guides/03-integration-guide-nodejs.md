@@ -38,12 +38,18 @@ internet.**
 
 Every conversion endpoint on this service works the exact same simple way:
 
+**Authentication.** Every conversion endpoint requires an API key (the health probes do not).
+Send it as either `X-API-Key: <key>` or `Authorization: Bearer <key>`. The server is configured
+with one or more keys via `API_KEYS` (comma-separated, for rotation). A missing or wrong key is
+`401` with `{"error":{"code":"UNAUTHORIZED", ...}}`.
+
 **You send a JSON request:**
 
 ```json
 {
   "content": "<html><body><h1>Hello {{.name}}</h1></body></html>",
-  "payload": { "name": "Ravi" }
+  "payload": { "name": "Ravi" },
+  "options": { "paperSize": "Letter", "landscape": false }
 }
 ```
 
@@ -52,6 +58,27 @@ Every conversion endpoint on this service works the exact same simple way:
 - `payload` — **optional.** If you include it, `content` is treated as a template, and the values
   in `payload` are filled into the placeholders before making the PDF. If you leave it out, your
   `content` is used exactly as-is.
+- `options` — **optional.** Page setup and wait strategy. Every field is optional and falls back
+  to the server's deployment default. See the table below.
+
+**Options** (all optional; `/v1/pdf/html` supports all, `/v1/pdf/markdown` supports all except
+`fitToPage`/`embedImages`/`overlay`, `/v1/pdf/html-lite` supports only `timeoutMs`):
+
+| Field | Type | Notes |
+|---|---|---|
+| `paperSize` | string | `Letter` `Legal` `Tabloid` `A3` `A4` `A5`. Or set `width`+`height` instead. |
+| `width`, `height` | string/number | A number is inches; a string may carry a unit (`"210mm"`, `"8.5in"`, `"72pt"`, `"96px"`, `"1cm"`). Must be set together. |
+| `landscape` | bool | |
+| `margin` | `{top,right,bottom,left}` | Each a length like `width`/`height`. |
+| `scale` | number | `0.1`–`2.0`. |
+| `printBackground` | bool | Default true. |
+| `displayHeaderFooter` | bool | Enables `headerTemplate`/`footerTemplate`. |
+| `headerTemplate`, `footerTemplate` | string | Chromium's own margin-box HTML (supports `.pageNumber`, `.totalPages`, …). |
+| `waitForFonts`, `waitForImages` | bool | Default true. |
+| `timeoutMs` | int | Whole-render budget, clamped to `[1000, 120000]`. |
+| `fitToPage` | bool | **`/v1/pdf/html` only.** Shrink content to a single page (min scale 0.6). The scale applied comes back in the `X-Fit-Scale` response header; `X-Fit-Overflow: true` means even 0.6 wasn't enough. |
+| `embedImages` | bool | **`/v1/pdf/html` only, and only if the server enabled it.** Fetch remote `<img src>` and inline them before rendering. |
+| `overlay` | `{html, pages?}` | **`/v1/pdf/html` only.** Render `html` on a transparent, full-size page and stamp it onto selected pages of the finished PDF — for a box that must land on *some* pages, not every page like `footerTemplate`. `pages`: `"last"` (default), `"first"`, `"all"`, or a list like `"3"`, `"3-5"`, `"2,4"`. The token `{{totalPages}}` in `html` becomes the final page count. The fragment places itself with its own CSS (e.g. `position:fixed; bottom:0`); unpainted areas stay transparent. |
 
 **You get back one of two things:**
 
@@ -67,7 +94,8 @@ Here are all the error codes you might see:
 
 | Code | HTTP status | What it means | What you should do |
 |---|---|---|---|
-| `INVALID_REQUEST` | 400 | Your request body was empty, broken JSON, or missing `content` | Fix your request — this is a bug on your side |
+| `UNAUTHORIZED` | 401 | No API key, or a key that isn't configured on the server | Send `X-API-Key` / `Authorization: Bearer` with a valid key |
+| `INVALID_REQUEST` | 400 | Empty body, broken JSON, missing `content`, or an unusable `options` object (unknown `paperSize`, `scale` out of range, a length that doesn't parse, `fitToPage`/`embedImages`/`overlay` on the wrong route, `overlay` with no `html` or a bad `pages` selector) | Fix your request — this is a bug on your side |
 | `REQUEST_TOO_LARGE` | 413 | Your HTML/Markdown was too big | Reduce the size, or split into smaller documents |
 | `TEMPLATE_ERROR` | 422 | Something's wrong with your template/data combination (e.g. you used `{{.name}}` but didn't send `name` in `payload`) | Check your template placeholders match your data fields |
 | `RENDER_ERROR` | 422 | The actual PDF rendering failed | Check your HTML/CSS for problems |
@@ -103,16 +131,24 @@ Create a file, say `pdfClient.js`:
 ```js
 // pdfClient.js
 const PDF_SERVICE_URL = process.env.PDF_SERVICE_URL || "http://localhost:8080";
+const PDF_SERVICE_API_KEY = process.env.PDF_SERVICE_API_KEY;
 
 /**
  * Calls the PDF service and returns the generated PDF as a Node.js Buffer.
  * Throws a clear Error if anything goes wrong.
  */
-async function generatePdf(endpoint, content, payload) {
+async function generatePdf(endpoint, content, payload, options) {
+  const body = { content };
+  if (payload) body.payload = payload;
+  if (options) body.options = options;
+
   const response = await fetch(`${PDF_SERVICE_URL}${endpoint}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload ? { content, payload } : { content }),
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-Key": PDF_SERVICE_API_KEY,
+    },
+    body: JSON.stringify(body),
   });
 
   if (!response.ok) {

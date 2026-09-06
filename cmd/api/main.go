@@ -18,11 +18,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Maulik-zuru/great-pdf-generator/internal/api"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/lightrender"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/observability"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/orchestration"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/renderengines"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/api"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/assets"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/auth"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/lightrender"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/observability"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/orchestration"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
 )
 
 // healthcheckFlag runs the process as a one-shot health probe instead of a
@@ -72,6 +74,31 @@ func main() {
 	chromiumPath := os.Getenv("CHROMIUM_PATH")
 	if chromiumPath == "" {
 		log.Fatal("CHROMIUM_PATH must be set to a headless Chromium / chrome-headless-shell binary")
+	}
+
+	// API-key auth (auth-and-tenancy v1). Fail closed: refuse to start with
+	// no keys unless AUTH_DISABLED=true is set explicitly, so a deployment
+	// can never be left open by forgetting an env var.
+	authKeys := splitList(os.Getenv("API_KEYS"))
+	if len(authKeys) == 0 && os.Getenv("AUTH_DISABLED") != "true" {
+		log.Fatal("API_KEYS must be set (comma-separated) or AUTH_DISABLED=true for local development")
+	}
+	authn := auth.New(authKeys, "/livez", "/readyz", "/healthz")
+
+	// Deployment-level render defaults (PDF_DEFAULT_*). Per-request options
+	// override these; these override renderengines.DefaultRenderOptions.
+	renderDefaults, err := renderDefaultsFromEnv()
+	if err != nil {
+		log.Fatalf("render defaults: %v", err)
+	}
+
+	serverOpts := []api.ServerOption{api.WithRenderDefaults(renderDefaults)}
+	if os.Getenv("EMBED_IMAGES_ENABLED") == "true" {
+		serverOpts = append(serverOpts, api.WithImageEmbedding(assets.Config{
+			AllowPrivate:        os.Getenv("EMBED_IMAGES_ALLOW_PRIVATE") == "true",
+			AllowedHostSuffixes: splitList(os.Getenv("EMBED_IMAGES_ALLOWED_HOSTS")),
+		}))
+		log.Print("image embedding enabled (options.embedImages honored)")
 	}
 
 	poolSize := envInt("POOL_SIZE", 2)
@@ -125,16 +152,25 @@ func main() {
 		})
 		defer weasyJobPool.Close()
 		srv = api.NewServer(pool, staticRenderer, chromiumJobPool, weasyJobPool,
-			api.WithRenderPoolHealth(pool))
+			append(serverOpts, api.WithRenderPoolHealth(pool))...)
 		log.Printf("lightweight-render (WeasyPrint) enabled at %s (workers=%d)", weasyPrintPath, weasyWorkers)
 	} else {
 		srv = api.NewServer(pool, nil, chromiumJobPool, nil,
-			api.WithRenderPoolHealth(pool))
+			append(serverOpts, api.WithRenderPoolHealth(pool))...)
 		log.Print("lightweight-render (WeasyPrint) not configured (WEASYPRINT_PATH unset); /v1/pdf/html-lite will return 503")
 	}
+
+	if authn.Enabled() {
+		log.Printf("api-key auth enabled (%d key(s) configured)", len(authKeys))
+	} else {
+		log.Print("WARNING: api-key auth DISABLED (AUTH_DISABLED=true) — never run this way outside local development")
+	}
+
 	httpServer := &http.Server{
-		Addr:              addr(),
-		Handler:           observability.RequestLogger(logger)(srv.Routes()),
+		Addr: addr(),
+		// Auth sits inside request logging so a rejected request is still
+		// logged with its correlation id.
+		Handler:           observability.RequestLogger(logger)(authn.Middleware(srv.Routes())),
 		ReadHeaderTimeout: 10 * time.Second,
 		// WriteTimeout is a few seconds above the default render budget
 		// (renderengines.DefaultRenderOptions().Timeout, currently 30s) so a
@@ -225,4 +261,70 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// splitList parses a comma-separated env value into trimmed, non-empty
+// entries. Used for API_KEYS and EMBED_IMAGES_ALLOWED_HOSTS.
+func splitList(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// renderDefaultsFromEnv builds the deployment's base render options from the
+// PDF_DEFAULT_* vars, starting from renderengines.DefaultRenderOptions. Only
+// the vars that are set are applied; an invalid value is a startup error, not
+// a silent fallback, so a typo in a deployment config is caught immediately.
+func renderDefaultsFromEnv() (renderengines.RenderOptions, error) {
+	d := renderengines.DefaultRenderOptions()
+
+	if v := os.Getenv("PDF_DEFAULT_PAPER"); v != "" {
+		w, h, ok := api.PaperSizeInches(v)
+		if !ok {
+			return d, fmt.Errorf("PDF_DEFAULT_PAPER: unknown paper size %q", v)
+		}
+		d.PaperWidth, d.PaperHeight = w, h
+	}
+
+	margins := []struct {
+		key string
+		dst *float64
+	}{
+		{"PDF_DEFAULT_MARGIN_TOP", &d.MarginTop},
+		{"PDF_DEFAULT_MARGIN_RIGHT", &d.MarginRight},
+		{"PDF_DEFAULT_MARGIN_BOTTOM", &d.MarginBottom},
+		{"PDF_DEFAULT_MARGIN_LEFT", &d.MarginLeft},
+	}
+	for _, m := range margins {
+		v := os.Getenv(m.key)
+		if v == "" {
+			continue
+		}
+		in, err := api.ParseDimension(v)
+		if err != nil {
+			return d, fmt.Errorf("%s: %w", m.key, err)
+		}
+		*m.dst = in
+	}
+
+	if v := os.Getenv("PDF_DEFAULT_LANDSCAPE"); v != "" {
+		d.Landscape = v == "true"
+	}
+	if v := os.Getenv("PDF_DEFAULT_PRINT_BACKGROUND"); v != "" {
+		d.PrintBackground = v == "true"
+	}
+	if v := os.Getenv("PDF_DEFAULT_DISPLAY_HEADER_FOOTER"); v != "" {
+		d.DisplayHeaderFooter = v == "true"
+	}
+	if v := os.Getenv("PDF_DEFAULT_FOOTER_TEMPLATE"); v != "" {
+		d.FooterTemplate = v
+	}
+	if v := os.Getenv("PDF_DEFAULT_HEADER_TEMPLATE"); v != "" {
+		d.HeaderTemplate = v
+	}
+	return d, nil
 }

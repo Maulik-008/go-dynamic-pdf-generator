@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Maulik-zuru/great-pdf-generator/internal/renderengines"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
 )
 
 // soakSample is one point on the memory-growth curve.

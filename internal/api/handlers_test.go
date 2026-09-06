@@ -9,27 +9,61 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Maulik-zuru/great-pdf-generator/internal/lightrender"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/orchestration"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/renderengines"
+	pdfcpuapi "github.com/pdfcpu/pdfcpu/pkg/api"
+
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/lightrender"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/orchestration"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
 )
 
 type fakeRenderer struct {
-	htmlCalls     []string
-	markdownCalls []string
-	err           error
+	htmlCalls      []string
+	htmlOpts       []renderengines.RenderOptions // opts for each RenderHTML call, in order
+	markdownCalls  []string
+	fittedCalls    []string
+	lastOpts       renderengines.RenderOptions
+	fittedScale    float64
+	fittedOverflow bool
+	err            error
+	// htmlPDF, when set, is returned by RenderHTML/RenderHTMLFitted instead
+	// of the "%PDF-1.4 fake" placeholder — needed by overlay tests, whose
+	// post-render pdfcpu step requires real, parseable PDF bytes.
+	htmlPDF []byte
 }
 
-func (f *fakeRenderer) RenderHTML(_ context.Context, html string, _ renderengines.RenderOptions) ([]byte, error) {
+func (f *fakeRenderer) htmlResult() []byte {
+	if f.htmlPDF != nil {
+		return f.htmlPDF
+	}
+	return []byte("%PDF-1.4 fake")
+}
+
+func (f *fakeRenderer) RenderHTML(_ context.Context, html string, opts renderengines.RenderOptions) ([]byte, error) {
 	f.htmlCalls = append(f.htmlCalls, html)
+	f.htmlOpts = append(f.htmlOpts, opts)
+	f.lastOpts = opts
 	if f.err != nil {
 		return nil, f.err
 	}
-	return []byte("%PDF-1.4 fake"), nil
+	return f.htmlResult(), nil
+}
+
+func (f *fakeRenderer) RenderHTMLFitted(_ context.Context, html string, opts renderengines.RenderOptions) (renderengines.FittedRender, error) {
+	f.fittedCalls = append(f.fittedCalls, html)
+	f.lastOpts = opts
+	if f.err != nil {
+		return renderengines.FittedRender{}, f.err
+	}
+	scale := f.fittedScale
+	if scale == 0 {
+		scale = 1
+	}
+	return renderengines.FittedRender{PDF: f.htmlResult(), Scale: scale, Overflowed: f.fittedOverflow}, nil
 }
 
 func (f *fakeRenderer) RenderMarkdown(_ context.Context, markdown string, _ renderengines.RenderOptions) ([]byte, error) {
@@ -287,6 +321,53 @@ func TestEndToEnd_RealPool_WithPayload(t *testing.T) {
 	}
 }
 
+// TestEndToEnd_RealPool_Overlay proves the overlay path end to end against
+// real Chromium + real pdfcpu: a two-page document plus an
+// options.overlay fragment comes back as a valid PDF with its page count
+// unchanged (the stamp composites onto an existing page, never adds one).
+// Token substitution and the fragment's render options are asserted
+// precisely against a fake in TestHandleHTML_Overlay_WiresThroughAndSubstitutesToken;
+// this test's job is to prove the real render -> render -> stamp wiring
+// doesn't error and produces a well-formed file.
+func TestEndToEnd_RealPool_Overlay(t *testing.T) {
+	path := os.Getenv("CHROMIUM_PATH")
+	if path == "" {
+		t.Skip("CHROMIUM_PATH not set; skipping real-Chromium end-to-end test")
+	}
+	pool, err := renderengines.NewPool(renderengines.PoolConfig{
+		Config: renderengines.Config{ChromiumPath: path},
+		Size:   1,
+	})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	t.Cleanup(func() { pool.Close() })
+
+	srv := NewServer(pool, nil, nil, nil)
+
+	const twoPages = `<html><body><div style="page-break-after:always">one</div><div>two</div></body></html>`
+	body := `{"content":` + strconv.Quote(twoPages) + `,` +
+		`"options":{"paperSize":"Letter","overlay":{` +
+		`"html":"<div style=\"position:fixed;bottom:0;left:0;width:100%;border-top:1px solid #000;font-size:9px\">Disclaimer — page {{totalPages}} of {{totalPages}}</div>",` +
+		`"pages":"last"}}}`
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, jsonReq(t, "/v1/pdf/html", body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	out := rec.Body.Bytes()
+	if !bytes.HasPrefix(out, []byte("%PDF-")) {
+		t.Fatalf("body does not start with %%PDF-")
+	}
+	if err := pdfcpuapi.Validate(bytes.NewReader(out), nil); err != nil {
+		t.Fatalf("overlay output fails PDF validation: %v", err)
+	}
+	if n, err := pdfcpuapi.PageCount(bytes.NewReader(out), nil); err != nil || n != 2 {
+		t.Fatalf("overlay output page count = %d (err %v), want 2", n, err)
+	}
+}
+
 func TestHealthz(t *testing.T) {
 	srv := NewServer(&fakeRenderer{}, nil, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -442,6 +523,11 @@ func (f *blockingFakeRenderer) RenderHTML(_ context.Context, _ string, _ rendere
 	return []byte("%PDF-1.4 fake"), nil
 }
 
+func (f *blockingFakeRenderer) RenderHTMLFitted(ctx context.Context, html string, opts renderengines.RenderOptions) (renderengines.FittedRender, error) {
+	pdf, err := f.RenderHTML(ctx, html, opts)
+	return renderengines.FittedRender{PDF: pdf, Scale: 1}, err
+}
+
 func (f *blockingFakeRenderer) RenderMarkdown(ctx context.Context, markdown string, opts renderengines.RenderOptions) ([]byte, error) {
 	return f.RenderHTML(ctx, markdown, opts)
 }
@@ -517,5 +603,97 @@ func TestEndToEnd_RealWeasyPrint(t *testing.T) {
 	}
 	if !bytes.HasPrefix(rec.Body.Bytes(), []byte("%PDF-")) {
 		t.Fatalf("body does not start with %%PDF-")
+	}
+}
+
+// --- options envelope + fitToPage (added for the medico integration) ---
+
+func TestHandleHTML_OptionsReachTheRenderer(t *testing.T) {
+	fr := &fakeRenderer{}
+	srv := NewServer(fr, nil, nil, nil)
+
+	body := `{"content":"<p>x</p>","options":{"paperSize":"A4","landscape":true,"scale":0.75,"margin":{"top":"1in"},"timeoutMs":9000}}`
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, jsonReq(t, "/v1/pdf/html", body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	o := fr.lastOpts
+	if o.PaperWidth != 8.27 || o.PaperHeight != 11.69 || !o.Landscape || o.Scale != 0.75 || o.MarginTop != 1 {
+		t.Fatalf("options not applied: %+v", o)
+	}
+	if o.Timeout != 9*time.Second {
+		t.Fatalf("timeout = %v, want 9s", o.Timeout)
+	}
+}
+
+func TestHandleHTML_RenderDefaultsAreTheBase(t *testing.T) {
+	fr := &fakeRenderer{}
+	base := renderengines.DefaultRenderOptions()
+	base.PaperWidth, base.PaperHeight = 8.5, 11 // Letter deployment default
+	srv := NewServer(fr, nil, nil, nil, WithRenderDefaults(base))
+
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, jsonReq(t, "/v1/pdf/html", `{"content":"<p>x</p>"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if fr.lastOpts.PaperWidth != 8.5 || fr.lastOpts.PaperHeight != 11 {
+		t.Fatalf("deployment default not used as base: %+v", fr.lastOpts)
+	}
+}
+
+func TestHandleHTML_FitToPageRoutesToFittedAndSetsHeaders(t *testing.T) {
+	fr := &fakeRenderer{fittedScale: 0.7, fittedOverflow: true}
+	srv := NewServer(fr, nil, nil, nil)
+
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, jsonReq(t, "/v1/pdf/html", `{"content":"<p>x</p>","options":{"fitToPage":true}}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(fr.fittedCalls) != 1 || len(fr.htmlCalls) != 0 {
+		t.Fatalf("fitToPage should call RenderHTMLFitted, not RenderHTML: fitted=%d html=%d", len(fr.fittedCalls), len(fr.htmlCalls))
+	}
+	if got := rec.Header().Get("X-Fit-Scale"); got != "0.7" {
+		t.Fatalf("X-Fit-Scale = %q, want 0.7", got)
+	}
+	if got := rec.Header().Get("X-Fit-Overflow"); got != "true" {
+		t.Fatalf("X-Fit-Overflow = %q, want true", got)
+	}
+}
+
+func TestHandleMarkdown_RejectsHTMLOnlyOptions(t *testing.T) {
+	srv := NewServer(&fakeRenderer{}, nil, nil, nil)
+	for _, body := range []string{
+		`{"content":"# x","options":{"fitToPage":true}}`,
+		`{"content":"# x","options":{"embedImages":true}}`,
+	} {
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, jsonReq(t, "/v1/pdf/markdown", body))
+		if rec.Code != http.StatusBadRequest || decodeError(t, rec).Code != "INVALID_REQUEST" {
+			t.Fatalf("%s: status = %d body=%s", body, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestHandleHTML_EmbedImagesRejectedWhenNotEnabled(t *testing.T) {
+	srv := NewServer(&fakeRenderer{}, nil, nil, nil) // no WithImageEmbedding
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, jsonReq(t, "/v1/pdf/html", `{"content":"<p>x</p>","options":{"embedImages":true}}`))
+	if rec.Code != http.StatusBadRequest || decodeError(t, rec).Code != "INVALID_REQUEST" {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleHTML_MalformedOptionsIsInvalidRequest(t *testing.T) {
+	srv := NewServer(&fakeRenderer{}, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, jsonReq(t, "/v1/pdf/html", `{"content":"<p>x</p>","options":{"margin":{"top":"10furlongs"}}}`))
+	if rec.Code != http.StatusBadRequest || decodeError(t, rec).Code != "INVALID_REQUEST" {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
 }
