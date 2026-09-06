@@ -18,13 +18,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Maulik-zuru/great-pdf-generator/internal/api"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/assets"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/auth"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/lightrender"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/observability"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/orchestration"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/renderengines"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/api"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/assets"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/auth"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/lightrender"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/observability"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/orchestration"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
 )
 
 // healthcheckFlag runs the process as a one-shot health probe instead of a

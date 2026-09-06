@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Maulik-zuru/great-pdf-generator/internal/lightrender"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/renderengines"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/lightrender"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
 )
 
 // TestDecodeConversionRequest_BodyOneByteOverLimitRejected and its sibling

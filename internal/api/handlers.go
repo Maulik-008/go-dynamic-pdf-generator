@@ -19,11 +19,12 @@ import (
 	"strconv"
 	"sync/atomic"
 
-	"github.com/Maulik-zuru/great-pdf-generator/internal/assets"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/customization"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/lightrender"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/orchestration"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/renderengines"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/assets"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/customization"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/lightrender"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/orchestration"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/overlay"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
 )
 
 // maxBodyBytes is a conservative placeholder ceiling for this slice.
@@ -298,44 +299,86 @@ func writePDF(w http.ResponseWriter, pdf []byte) {
 // and fitToPage are HTML-only: fitToPage measures a rendered DOM (there is
 // no DOM before goldmark runs on the markdown path), and embedImages
 // rewrites <img> tags that markdown image syntax hasn't produced yet.
+// overlay is HTML-only for the same structural reason as fitToPage plus a
+// practical one — it is a Chromium-rendered composition step, and the
+// markdown and WeasyPrint paths have no equivalent notion.
 type routeCaps struct {
 	allowEmbedImages bool
 	allowFitToPage   bool
+	allowOverlay     bool
+}
+
+// gatedHTMLRenderer adapts the server's renderer + job pool to
+// overlay.FragmentRenderer, so the overlay fragment render passes through
+// the same admission control as any other Chromium render. It is called
+// only after the main render's own Submit has returned, never nested
+// inside it, so the two renders take an admission slot one at a time
+// rather than deadlocking a saturated pool.
+type gatedHTMLRenderer struct{ s *Server }
+
+func (g gatedHTMLRenderer) RenderHTML(ctx context.Context, html string, opts renderengines.RenderOptions) ([]byte, error) {
+	return submit(ctx, g.s.jobPool, func(ctx context.Context) ([]byte, error) {
+		return g.s.renderer.RenderHTML(ctx, html, opts)
+	})
+}
+
+// maybeOverlay applies spec to pdf when one was requested, returning pdf
+// unchanged otherwise. base is the fully-resolved render options for the
+// main document — the fragment is rendered at the same page size and
+// orientation.
+func (s *Server) maybeOverlay(ctx context.Context, pdf []byte, spec *overlay.Spec, base renderengines.RenderOptions) ([]byte, error) {
+	if spec == nil {
+		return pdf, nil
+	}
+	return overlay.Apply(ctx, gatedHTMLRenderer{s}, pdf, *spec, base)
 }
 
 // prepareRender runs the shared front half of every Chromium-backed route:
 // decode -> resolve options against the deployment defaults -> merge the
 // payload -> (optionally) inline remote images. On any failure it has
-// already written the error envelope and returns ok=false.
-func (s *Server) prepareRender(w http.ResponseWriter, r *http.Request, caps routeCaps) (content string, opts renderengines.RenderOptions, fitToPage bool, ok bool) {
+// already written the error envelope and returns ok=false. overlaySpec is
+// non-nil only when the request asked for one and the route allows it.
+func (s *Server) prepareRender(w http.ResponseWriter, r *http.Request, caps routeCaps) (content string, opts renderengines.RenderOptions, fitToPage bool, overlaySpec *overlay.Spec, ok bool) {
 	req, ok := decodeConversionRequest(w, r)
 	if !ok {
-		return "", opts, false, false
+		return "", opts, false, nil, false
 	}
 
 	opts, embedImages, fitToPage, err := req.Options.resolve(s.renderDefaults)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
-		return "", opts, false, false
+		return "", opts, false, nil, false
 	}
 	if fitToPage && !caps.allowFitToPage {
 		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "options.fitToPage is only supported on /v1/pdf/html")
-		return "", opts, false, false
+		return "", opts, false, nil, false
 	}
 	if embedImages && !caps.allowEmbedImages {
 		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "options.embedImages is only supported on /v1/pdf/html")
-		return "", opts, false, false
+		return "", opts, false, nil, false
+	}
+
+	if req.Options != nil {
+		overlaySpec, err = req.Options.Overlay.spec()
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+			return "", opts, false, nil, false
+		}
+		if overlaySpec != nil && !caps.allowOverlay {
+			writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "options.overlay is only supported on /v1/pdf/html")
+			return "", opts, false, nil, false
+		}
 	}
 
 	content, ok = mergeIfNeeded(w, req)
 	if !ok {
-		return "", opts, false, false
+		return "", opts, false, nil, false
 	}
 
 	if embedImages {
 		if s.imageEmbedding == nil {
 			writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "options.embedImages is not enabled on this server")
-			return "", opts, false, false
+			return "", opts, false, nil, false
 		}
 		embedded, stats := assets.Embed(r.Context(), content, *s.imageEmbedding)
 		content = embedded
@@ -345,11 +388,11 @@ func (s *Server) prepareRender(w http.ResponseWriter, r *http.Request, caps rout
 				"failed", stats.Failed, "skipped", stats.Skipped, "bytes", stats.Bytes)
 		}
 	}
-	return content, opts, fitToPage, true
+	return content, opts, fitToPage, overlaySpec, true
 }
 
 func (s *Server) handleHTML(w http.ResponseWriter, r *http.Request) {
-	content, opts, fitToPage, ok := s.prepareRender(w, r, routeCaps{allowEmbedImages: true, allowFitToPage: true})
+	content, opts, fitToPage, overlaySpec, ok := s.prepareRender(w, r, routeCaps{allowEmbedImages: true, allowFitToPage: true, allowOverlay: true})
 	if !ok {
 		return
 	}
@@ -361,11 +404,15 @@ func (s *Server) handleHTML(w http.ResponseWriter, r *http.Request) {
 		if writeRenderError(w, err) {
 			return
 		}
+		pdf, err := s.maybeOverlay(r.Context(), res.PDF, overlaySpec, opts)
+		if writeRenderError(w, err) {
+			return
+		}
 		// fitToPage returns raw PDF bytes like every other success, so the
 		// scale actually applied travels in headers rather than a JSON body.
 		w.Header().Set("X-Fit-Scale", strconv.FormatFloat(res.Scale, 'f', -1, 64))
 		w.Header().Set("X-Fit-Overflow", strconv.FormatBool(res.Overflowed))
-		writePDF(w, res.PDF)
+		writePDF(w, pdf)
 		return
 	}
 
@@ -375,11 +422,15 @@ func (s *Server) handleHTML(w http.ResponseWriter, r *http.Request) {
 	if writeRenderError(w, err) {
 		return
 	}
+	pdf, err = s.maybeOverlay(r.Context(), pdf, overlaySpec, opts)
+	if writeRenderError(w, err) {
+		return
+	}
 	writePDF(w, pdf)
 }
 
 func (s *Server) handleMarkdown(w http.ResponseWriter, r *http.Request) {
-	content, opts, _, ok := s.prepareRender(w, r, routeCaps{})
+	content, opts, _, _, ok := s.prepareRender(w, r, routeCaps{})
 	if !ok {
 		return
 	}
@@ -406,7 +457,7 @@ func (s *Server) handleHTMLLite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	content, opts, _, ok := s.prepareRender(w, r, routeCaps{})
+	content, opts, _, _, ok := s.prepareRender(w, r, routeCaps{})
 	if !ok {
 		return
 	}

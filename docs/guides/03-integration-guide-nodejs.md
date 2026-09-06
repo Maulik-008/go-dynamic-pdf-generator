@@ -62,7 +62,7 @@ with one or more keys via `API_KEYS` (comma-separated, for rotation). A missing 
   to the server's deployment default. See the table below.
 
 **Options** (all optional; `/v1/pdf/html` supports all, `/v1/pdf/markdown` supports all except
-`fitToPage`/`embedImages`, `/v1/pdf/html-lite` supports only `timeoutMs`):
+`fitToPage`/`embedImages`/`overlay`, `/v1/pdf/html-lite` supports only `timeoutMs`):
 
 | Field | Type | Notes |
 |---|---|---|
@@ -78,6 +78,7 @@ with one or more keys via `API_KEYS` (comma-separated, for rotation). A missing 
 | `timeoutMs` | int | Whole-render budget, clamped to `[1000, 120000]`. |
 | `fitToPage` | bool | **`/v1/pdf/html` only.** Shrink content to a single page (min scale 0.6). The scale applied comes back in the `X-Fit-Scale` response header; `X-Fit-Overflow: true` means even 0.6 wasn't enough. |
 | `embedImages` | bool | **`/v1/pdf/html` only, and only if the server enabled it.** Fetch remote `<img src>` and inline them before rendering. |
+| `overlay` | `{html, pages?}` | **`/v1/pdf/html` only.** Render `html` on a transparent, full-size page and stamp it onto selected pages of the finished PDF — for a box that must land on *some* pages, not every page like `footerTemplate`. `pages`: `"last"` (default), `"first"`, `"all"`, or a list like `"3"`, `"3-5"`, `"2,4"`. The token `{{totalPages}}` in `html` becomes the final page count. The fragment places itself with its own CSS (e.g. `position:fixed; bottom:0`); unpainted areas stay transparent. |
 
 **You get back one of two things:**
 
@@ -94,7 +95,7 @@ Here are all the error codes you might see:
 | Code | HTTP status | What it means | What you should do |
 |---|---|---|---|
 | `UNAUTHORIZED` | 401 | No API key, or a key that isn't configured on the server | Send `X-API-Key` / `Authorization: Bearer` with a valid key |
-| `INVALID_REQUEST` | 400 | Empty body, broken JSON, missing `content`, or an unusable `options` object (unknown `paperSize`, `scale` out of range, a length that doesn't parse, `fitToPage`/`embedImages` on the wrong route) | Fix your request — this is a bug on your side |
+| `INVALID_REQUEST` | 400 | Empty body, broken JSON, missing `content`, or an unusable `options` object (unknown `paperSize`, `scale` out of range, a length that doesn't parse, `fitToPage`/`embedImages`/`overlay` on the wrong route, `overlay` with no `html` or a bad `pages` selector) | Fix your request — this is a bug on your side |
 | `REQUEST_TOO_LARGE` | 413 | Your HTML/Markdown was too big | Reduce the size, or split into smaller documents |
 | `TEMPLATE_ERROR` | 422 | Something's wrong with your template/data combination (e.g. you used `{{.name}}` but didn't send `name` in `payload`) | Check your template placeholders match your data fields |
 | `RENDER_ERROR` | 422 | The actual PDF rendering failed | Check your HTML/CSS for problems |

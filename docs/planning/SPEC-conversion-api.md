@@ -206,7 +206,11 @@ unaffected.
     "waitForFonts": true, "waitForImages": true,
     "timeoutMs": 30000,                               // clamped to [1000, 120000]
     "embedImages": false,                             // /v1/pdf/html only; requires EMBED_IMAGES_ENABLED
-    "fitToPage": false                                // /v1/pdf/html only
+    "fitToPage": false,                               // /v1/pdf/html only
+    "overlay": {                                      // /v1/pdf/html only
+      "html": "<div style=…>…{{totalPages}}…</div>", //   fragment rendered on a transparent page
+      "pages": "last"                                 //   "last"(default)|"first"|"all"|"3"|"3-5"|"2,4"
+    }
   }
 }
 ```
@@ -237,14 +241,54 @@ For Synectus Medico specifically this is optional: every image in its report/int
 already an absolute signed-S3 URL or a `data:` URI, which Chromium fetches directly — `embedImages`
 is a latency/resilience nicety, not a correctness requirement.
 
+### `overlay`
+
+A rendered HTML fragment stamped onto **specific pages** of the finished PDF — the job Chromium's
+own `headerTemplate`/`footerTemplate` can't do, because those repeat on *every* page. The concrete
+driver is Synectus Medico's report disclaimer: a bordered box that must appear on the **last page
+only**. `pdf-service-saas` did this with a second Puppeteer render plus a `pdf-lib`
+`page.drawPage` overlay; after the switch to this service that overlay had been living on in
+`saas-backend` (`utils/helpers/pdf-lib/addDisclaimerFooter.js`). `options.overlay` moves it here so
+the caller stops post-processing render output.
+
+Two fields:
+
+- **`html`** (required) — the fragment. It is rendered on its own page the exact size and
+  orientation of the main document, with **zero margins, no Chromium header/footer, native scale,
+  backgrounds on**. The fragment positions itself with its own CSS (typically
+  `position:fixed; bottom:0`); every area it doesn't paint stays transparent, so only its visible
+  box composites onto the target page — same result as `pdf-lib`'s `drawPage` at `{x:0, y:0,
+  width, height}`. The literal token **`{{totalPages}}`** in `html` is replaced with the main
+  document's final page count before the fragment renders (a single documented substring swap, not
+  a template engine — any other `{{…}}` is left untouched).
+- **`pages`** (optional, default `"last"`) — which 1-based pages to stamp: `"last"`, `"first"`,
+  `"all"`, or an explicit list of single pages / ascending ranges (`"3"`, `"3-5"`, `"2,4"`,
+  `"1,3-4"`). Deliberately narrower than pdfcpu's own selection grammar (no `l`, `even`, `odd`,
+  negation, open-ended ranges) so callers get one predictable shape and this service owns every
+  error message. A page past the end of the document is a `422 RENDER_ERROR` — the real page count
+  isn't known until the main render completes, so it can't be a `400`.
+
+Mechanics: `internal/overlay` counts the main PDF's pages (**pdfcpu**, pure Go — the first, narrow
+use of the direct-construction "fast path" `CAPABILITY-MAP.md` assigns to `render-engines`, brought
+in ahead of the full Phase 8 image/manipulation slice), substitutes the token, renders the fragment
+through the **same admission-gated Chromium path** as any other request (so a fragment render is
+subject to the same backpressure — an overlay request therefore takes an admission slot twice, in
+sequence, and can get a `503 QUEUE_FULL` on the fragment render even after the main render
+succeeded), then stamps it with `pdfcpu.AddWatermarks` (`onTop`). Page count and existing page
+content are preserved — the stamp is drawn over, never inserted. Full text/image watermarking (all
+pages, opacity, rotation, positioning grammar) stays the separate deferred `customization-layer`
+slice; this is one composited overlay.
+
 ### Error code additions
 
 | Code | Status | When |
 |---|---|---|
-| `INVALID_REQUEST` | 400 | unknown `paperSize`, `scale` out of range, `width`/`height` not paired, a length that doesn't parse, `fitToPage`/`embedImages` on a non-HTML route, `embedImages` when the server hasn't enabled it |
+| `INVALID_REQUEST` | 400 | unknown `paperSize`, `scale` out of range, `width`/`height` not paired, a length that doesn't parse, `fitToPage`/`embedImages`/`overlay` on a non-HTML route, `embedImages` when the server hasn't enabled it, `overlay` with an empty `html` or an unparseable `pages` selector |
+| `RENDER_ERROR` | 422 | (existing) — now also: `overlay.pages` names a page past the end of the rendered document (only knowable after the main render), or the fragment render / stamp step fails |
 
 (No new top-level code — an unusable options object is a caller-side mistake, same class as a
-malformed body.)
+malformed body; an overlay that can't be applied to the produced PDF is the same class as any other
+post-decode render failure.)
 
 ### Route support matrix
 
@@ -253,6 +297,10 @@ malformed body.)
 | paper / margin / scale / header-footer / wait / timeout | ✅ | ✅ | timeout only (WeasyPrint has no page-setup concept) |
 | `fitToPage` | ✅ | ✗ 400 | ✗ 400 |
 | `embedImages` | ✅ (if enabled) | ✗ 400 | ✗ 400 |
+| `overlay` | ✅ | ✗ 400 | ✗ 400 |
 
 `fitToPage` and `embedImages` are HTML-only for a structural reason: there is no DOM to measure,
-and no `<img>` tag to rewrite, before goldmark runs on the markdown path.
+and no `<img>` tag to rewrite, before goldmark runs on the markdown path. `overlay` is HTML-only
+because its fragment is itself a Chromium render (so its CSS behaves exactly like the main
+document's), and neither the markdown nor the WeasyPrint path has an equivalent post-render
+composition step.

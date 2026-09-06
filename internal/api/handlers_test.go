@@ -9,32 +9,48 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Maulik-zuru/great-pdf-generator/internal/lightrender"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/orchestration"
-	"github.com/Maulik-zuru/great-pdf-generator/internal/renderengines"
+	pdfcpuapi "github.com/pdfcpu/pdfcpu/pkg/api"
+
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/lightrender"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/orchestration"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
 )
 
 type fakeRenderer struct {
 	htmlCalls      []string
+	htmlOpts       []renderengines.RenderOptions // opts for each RenderHTML call, in order
 	markdownCalls  []string
 	fittedCalls    []string
 	lastOpts       renderengines.RenderOptions
 	fittedScale    float64
 	fittedOverflow bool
 	err            error
+	// htmlPDF, when set, is returned by RenderHTML/RenderHTMLFitted instead
+	// of the "%PDF-1.4 fake" placeholder — needed by overlay tests, whose
+	// post-render pdfcpu step requires real, parseable PDF bytes.
+	htmlPDF []byte
+}
+
+func (f *fakeRenderer) htmlResult() []byte {
+	if f.htmlPDF != nil {
+		return f.htmlPDF
+	}
+	return []byte("%PDF-1.4 fake")
 }
 
 func (f *fakeRenderer) RenderHTML(_ context.Context, html string, opts renderengines.RenderOptions) ([]byte, error) {
 	f.htmlCalls = append(f.htmlCalls, html)
+	f.htmlOpts = append(f.htmlOpts, opts)
 	f.lastOpts = opts
 	if f.err != nil {
 		return nil, f.err
 	}
-	return []byte("%PDF-1.4 fake"), nil
+	return f.htmlResult(), nil
 }
 
 func (f *fakeRenderer) RenderHTMLFitted(_ context.Context, html string, opts renderengines.RenderOptions) (renderengines.FittedRender, error) {
@@ -47,7 +63,7 @@ func (f *fakeRenderer) RenderHTMLFitted(_ context.Context, html string, opts ren
 	if scale == 0 {
 		scale = 1
 	}
-	return renderengines.FittedRender{PDF: []byte("%PDF-1.4 fake"), Scale: scale, Overflowed: f.fittedOverflow}, nil
+	return renderengines.FittedRender{PDF: f.htmlResult(), Scale: scale, Overflowed: f.fittedOverflow}, nil
 }
 
 func (f *fakeRenderer) RenderMarkdown(_ context.Context, markdown string, _ renderengines.RenderOptions) ([]byte, error) {
@@ -302,6 +318,53 @@ func TestEndToEnd_RealPool_WithPayload(t *testing.T) {
 	}
 	if !bytes.HasPrefix(rec.Body.Bytes(), []byte("%PDF-")) {
 		t.Fatalf("body does not start with %%PDF-")
+	}
+}
+
+// TestEndToEnd_RealPool_Overlay proves the overlay path end to end against
+// real Chromium + real pdfcpu: a two-page document plus an
+// options.overlay fragment comes back as a valid PDF with its page count
+// unchanged (the stamp composites onto an existing page, never adds one).
+// Token substitution and the fragment's render options are asserted
+// precisely against a fake in TestHandleHTML_Overlay_WiresThroughAndSubstitutesToken;
+// this test's job is to prove the real render -> render -> stamp wiring
+// doesn't error and produces a well-formed file.
+func TestEndToEnd_RealPool_Overlay(t *testing.T) {
+	path := os.Getenv("CHROMIUM_PATH")
+	if path == "" {
+		t.Skip("CHROMIUM_PATH not set; skipping real-Chromium end-to-end test")
+	}
+	pool, err := renderengines.NewPool(renderengines.PoolConfig{
+		Config: renderengines.Config{ChromiumPath: path},
+		Size:   1,
+	})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	t.Cleanup(func() { pool.Close() })
+
+	srv := NewServer(pool, nil, nil, nil)
+
+	const twoPages = `<html><body><div style="page-break-after:always">one</div><div>two</div></body></html>`
+	body := `{"content":` + strconv.Quote(twoPages) + `,` +
+		`"options":{"paperSize":"Letter","overlay":{` +
+		`"html":"<div style=\"position:fixed;bottom:0;left:0;width:100%;border-top:1px solid #000;font-size:9px\">Disclaimer — page {{totalPages}} of {{totalPages}}</div>",` +
+		`"pages":"last"}}}`
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, jsonReq(t, "/v1/pdf/html", body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	out := rec.Body.Bytes()
+	if !bytes.HasPrefix(out, []byte("%PDF-")) {
+		t.Fatalf("body does not start with %%PDF-")
+	}
+	if err := pdfcpuapi.Validate(bytes.NewReader(out), nil); err != nil {
+		t.Fatalf("overlay output fails PDF validation: %v", err)
+	}
+	if n, err := pdfcpuapi.PageCount(bytes.NewReader(out), nil); err != nil || n != 2 {
+		t.Fatalf("overlay output page count = %d (err %v), want 2", n, err)
 	}
 }
 

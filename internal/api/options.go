@@ -17,7 +17,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Maulik-zuru/great-pdf-generator/internal/renderengines"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/overlay"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
 )
 
 // optionsInput is the decoded `options` object. Optional scalars are
@@ -44,6 +45,8 @@ type optionsInput struct {
 
 	EmbedImages *bool `json:"embedImages"`
 	FitToPage   *bool `json:"fitToPage"`
+
+	Overlay *overlayInput `json:"overlay"`
 }
 
 type marginInput struct {
@@ -51,6 +54,39 @@ type marginInput struct {
 	Right  dimension `json:"right"`
 	Bottom dimension `json:"bottom"`
 	Left   dimension `json:"left"`
+}
+
+// overlayInput is the decoded options.overlay object: an HTML fragment
+// rendered on its own transparent page and stamped onto selected pages of
+// the finished PDF (see internal/overlay). It is HTML-route only, and
+// resolved separately from the render options because it isn't one — it's
+// a post-render composition step.
+type overlayInput struct {
+	HTML  string  `json:"html"`
+	Pages *string `json:"pages"` // absent => "last"
+}
+
+// spec validates the overlay object and returns it as an *overlay.Spec, or
+// nil when no overlay was requested. A returned error is always a
+// caller-side problem — the handler maps it to 400 INVALID_REQUEST.
+func (o *overlayInput) spec() (*overlay.Spec, error) {
+	if o == nil {
+		return nil, nil
+	}
+	if strings.TrimSpace(o.HTML) == "" {
+		return nil, fmt.Errorf("options.overlay: \"html\" is required")
+	}
+	pages := "last"
+	if o.Pages != nil {
+		pages = *o.Pages
+	}
+	// Validate the selector now (page-count-independent checks) so a typo
+	// is a 400 before any rendering work starts; the bounds check against
+	// the real page count happens in overlay.Apply.
+	if err := overlay.ValidatePages(pages); err != nil {
+		return nil, fmt.Errorf("options.overlay: %w", err)
+	}
+	return &overlay.Spec{HTML: o.HTML, Pages: pages}, nil
 }
 
 // dimension is a length accepted either as a number (inches) or a string

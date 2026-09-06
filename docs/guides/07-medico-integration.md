@@ -82,7 +82,7 @@ curl -s -D - -o fit.pdf -XPOST $BASE/v1/pdf/html -H "X-API-Key: $KEY" -H 'Conten
 |---|---|---|
 | HTML → PDF render | Node + `puppeteer-cluster`, `maxConcurrency=1` | this service (Go, real pool + crash recovery + backpressure) |
 | Page-number footer | hard-coded in the service | `saas-backend` sends it as `options.footerTemplate` + `displayHeaderFooter` |
-| Disclaimer footer overlay (last page) | `pdfGenerator.addFooter` (pdf-lib) in the service | **stays in `saas-backend`** — a local pdf-lib overlay after the render |
+| Disclaimer footer overlay (last page) | `pdfGenerator.addFooter` (pdf-lib) in the service | **capability now lives here** as `options.overlay` (pdfcpu stamp — see `SPEC-conversion-api.md`). `saas-backend` still applies its own local pdf-lib overlay (`utils/helpers/pdf-lib/addDisclaimerFooter.js`) for now; switching it to send `options.overlay` and deleting that helper is a follow-up, not done in this pass. |
 | Embedded uploaded-PDF merge, multi-chunk report assembly | already in `saas-backend` (`generatePatientReportPdf`, `mergePDFs`) | unchanged |
 | `fitToPage` (ONE_PAGE reports) | service measures + scales, returns `X-Fit-*` headers | identical — this service does the same |
 | Auth | `X-API-Key` vs `PDF_SERVICE_API_KEY` | identical header, checked with constant-time compare; `Authorization: Bearer` also accepted |
@@ -120,11 +120,31 @@ X-API-Key: {PDF_SERVICE_API_KEY}
 ```
 
 - Success → raw PDF bytes. If `fitToPage`, read `X-Fit-Scale` / `X-Fit-Overflow` response headers.
-- If `footerContent` was passed, `pdfServiceClient` then applies the disclaimer overlay to the
+- If `footerContent` was passed, `pdfServiceClient` still applies the disclaimer overlay to the
   returned buffer locally (pdf-lib), exactly as `pdf-service-saas` did — see
-  `utils/helpers/pdf-lib/addDisclaimerFooter.js`.
+  `utils/helpers/pdf-lib/addDisclaimerFooter.js`. The service can now do this itself via
+  `options.overlay` (below); moving `saas-backend` onto it is a planned follow-up.
 - Errors → JSON `{"error":{"code","message"}}`; `QUEUE_FULL`/`ENGINE_UNAVAILABLE` carry
   `Retry-After`.
+
+Once `saas-backend` switches over, the disclaimer render+overlay becomes part of the same request
+instead of a second local pass:
+
+```jsonc
+{
+  "content": htmlContent,
+  "options": {
+    "paperSize": "Letter", "landscape": landscape,
+    "margin": { "top": "0", "right": "0", "bottom": "10mm", "left": "0" },
+    "printBackground": true, "displayHeaderFooter": true,
+    "footerTemplate": "<the page-number template>",
+    "fitToPage": fitToPage === true,
+    // only when footerContent is set — the box CSS + {{totalPages}} layout
+    // currently built in addDisclaimerFooter.js, sent as-is:
+    "overlay": { "pages": "last", "html": "<style>…</style><div class=\"disclaimer-footer\">…{{totalPages}} / {{totalPages}}…</div>" }
+  }
+}
+```
 
 Setting the same values as `PDF_DEFAULT_*` on the service (see `deploy/systemd/great-pdf-generator.env`)
 is belt-and-suspenders: the client sends them explicitly so output does not depend on the

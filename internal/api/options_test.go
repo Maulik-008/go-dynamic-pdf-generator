@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Maulik-zuru/great-pdf-generator/internal/renderengines"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
 )
 
 func TestParseDimension(t *testing.T) {

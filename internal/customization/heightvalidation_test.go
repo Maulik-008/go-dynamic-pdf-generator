@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Maulik-zuru/great-pdf-generator/internal/renderengines"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
 )
 
 // fakeHeightMeasurer lets tests control exactly what height a template
