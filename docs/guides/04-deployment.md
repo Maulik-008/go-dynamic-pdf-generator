@@ -63,12 +63,12 @@ would destroy recovery that was already in progress.
 ```bash
 go build -o pdfsvc ./cmd/api
 sudo install -m755 pdfsvc /usr/local/bin/pdfsvc
-sudo useradd --system --home /var/lib/great-pdf-generator --create-home pdfsvc
-sudo cp deploy/systemd/great-pdf-generator.env /etc/great-pdf-generator.env
-sudo cp deploy/systemd/great-pdf-generator.service /etc/systemd/system/
+sudo useradd --system --home /var/lib/go-dynamic-pdf-generator --create-home pdfsvc
+sudo cp deploy/systemd/go-dynamic-pdf-generator.env /etc/go-dynamic-pdf-generator.env
+sudo cp deploy/systemd/go-dynamic-pdf-generator.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now great-pdf-generator
-systemctl status great-pdf-generator
+sudo systemctl enable --now go-dynamic-pdf-generator
+systemctl status go-dynamic-pdf-generator
 ```
 
 Two settings there are load-bearing and worth understanding rather than copying

@@ -4,7 +4,7 @@ Implementation plan for `docs/planning/SPEC-render-engines.md`.
 
 ## Components and dependencies
 
-1. **Go module scaffold** — `go.mod` (`github.com/Maulik-zuru/great-pdf-generator`), directory
+1. **Go module scaffold** — `go.mod` (`github.com/Maulik-008/go-dynamic-pdf-generator`), directory
    layout per the platform spec. No dependencies; everything else needs this first.
 2. **`options.go`** — `RenderOptions` type (v1 subset: format/orientation/margins, header/footer
    template strings, wait strategy). No dependencies.

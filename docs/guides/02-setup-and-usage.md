@@ -18,7 +18,7 @@ and a Chromium binary are enough to get the core feature working.
 
 ```bash
 git clone <your-repo-url>
-cd great-pdf-generator
+cd go-dynamic-pdf-generator
 go build ./...
 ```
 

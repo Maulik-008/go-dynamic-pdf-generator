@@ -79,8 +79,8 @@ sudo tee /opt/aws/amazon-cloudwatch-agent/bin/config.json >/dev/null <<'EOF'
       "files": {
         "collect_list": [
           {
-            "file_path": "/var/log/great-pdf-generator/app.log",
-            "log_group_name": "great-pdf-generator",
+            "file_path": "/var/log/go-dynamic-pdf-generator/app.log",
+            "log_group_name": "go-dynamic-pdf-generator",
             "log_stream_name": "{instance_id}"
           }
         ]
@@ -99,22 +99,22 @@ The `logs` section ships this service's own logs to CloudWatch Logs for searchin
 default (it logs to stdout/journald). Add one line to the systemd unit to redirect it:
 
 ```ini
-# in /etc/systemd/system/great-pdf-generator.service, under [Service]:
-StandardOutput=append:/var/log/great-pdf-generator/app.log
+# in /etc/systemd/system/go-dynamic-pdf-generator.service, under [Service]:
+StandardOutput=append:/var/log/go-dynamic-pdf-generator/app.log
 ```
 
 ```bash
-sudo mkdir -p /var/log/great-pdf-generator
-sudo chown pdfsvc:pdfsvc /var/log/great-pdf-generator
-sudo systemctl daemon-reload && sudo systemctl restart great-pdf-generator
+sudo mkdir -p /var/log/go-dynamic-pdf-generator
+sudo chown pdfsvc:pdfsvc /var/log/go-dynamic-pdf-generator
+sudo systemctl daemon-reload && sudo systemctl restart go-dynamic-pdf-generator
 ```
 
 Since this file now grows forever on its own, give it a rotation policy (this is the same disk
 hygiene principle as `docs/guides/05-small-vm-production-and-migration-guide.md` §2.3):
 
 ```bash
-sudo tee /etc/logrotate.d/great-pdf-generator >/dev/null <<'EOF'
-/var/log/great-pdf-generator/app.log {
+sudo tee /etc/logrotate.d/go-dynamic-pdf-generator >/dev/null <<'EOF'
+/var/log/go-dynamic-pdf-generator/app.log {
     daily
     rotate 7
     compress
@@ -317,7 +317,7 @@ pattern into a number CloudWatch can alarm on:
 
 ```bash
 aws logs put-metric-filter \
-  --log-group-name "great-pdf-generator" \
+  --log-group-name "go-dynamic-pdf-generator" \
   --filter-name "server-errors" \
   --filter-pattern '{ $.level = "ERROR" }' \
   --metric-transformations \
@@ -351,9 +351,9 @@ fallocate -l 3G /tmp/filler.img   # size this to whatever pushes your disk past 
 rm /tmp/filler.img                 # clean up immediately after confirming the alarm fired
 
 # Service down (confirms both the systemd auto-restart AND the ServiceHealthy alarm)
-sudo systemctl stop great-pdf-generator
+sudo systemctl stop go-dynamic-pdf-generator
 sleep 90
-sudo systemctl start great-pdf-generator
+sudo systemctl start go-dynamic-pdf-generator
 ```
 Watch `aws cloudwatch describe-alarms --alarm-names <name>` transition through `INSUFFICIENT_DATA`
 → `ALARM` → `OK`, and confirm the SNS notification actually lands in your inbox each time.

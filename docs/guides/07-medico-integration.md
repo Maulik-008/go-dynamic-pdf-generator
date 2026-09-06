@@ -146,7 +146,7 @@ instead of a second local pass:
 }
 ```
 
-Setting the same values as `PDF_DEFAULT_*` on the service (see `deploy/systemd/great-pdf-generator.env`)
+Setting the same values as `PDF_DEFAULT_*` on the service (see `deploy/systemd/go-dynamic-pdf-generator.env`)
 is belt-and-suspenders: the client sends them explicitly so output does not depend on the
 deployment being configured, and the deployment defaults document the intent and cover any caller
 that sends no options.

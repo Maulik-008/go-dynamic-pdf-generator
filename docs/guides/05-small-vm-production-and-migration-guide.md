@@ -168,7 +168,7 @@ with `POOL_SIZE=1`.
 ### 3.2 The full environment file
 
 ```bash
-sudo tee /etc/great-pdf-generator.env >/dev/null <<'EOF'
+sudo tee /etc/go-dynamic-pdf-generator.env >/dev/null <<'EOF'
 # --- required ---------------------------------------------------------------
 CHROMIUM_PATH=/opt/chrome-headless-shell/chrome-headless-shell
 
@@ -197,9 +197,9 @@ EOF
 ### 3.3 The systemd unit, with a memory ceiling sized to this box
 
 ```bash
-sudo tee /etc/systemd/system/great-pdf-generator.service >/dev/null <<'EOF'
+sudo tee /etc/systemd/system/go-dynamic-pdf-generator.service >/dev/null <<'EOF'
 [Unit]
-Description=great-pdf-generator (HTML/Markdown to PDF service)
+Description=go-dynamic-pdf-generator (HTML/Markdown to PDF service)
 After=network-online.target
 Wants=network-online.target
 
@@ -207,7 +207,7 @@ Wants=network-online.target
 Type=exec
 User=pdfsvc
 Group=pdfsvc
-EnvironmentFile=/etc/great-pdf-generator.env
+EnvironmentFile=/etc/go-dynamic-pdf-generator.env
 ExecStart=/usr/local/bin/pdfsvc
 
 # Auto-restart (this is the process-supervision answer to "who restarts it
@@ -231,8 +231,8 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
-StateDirectory=great-pdf-generator
-Environment=HOME=/var/lib/great-pdf-generator
+StateDirectory=go-dynamic-pdf-generator
+Environment=HOME=/var/lib/go-dynamic-pdf-generator
 
 # Sized for a ~2GB-RAM VM: leaves ~500-600MB headroom for the OS/sshd, so
 # systemd's cgroup kills *this service* on a real leak rather than the
@@ -245,8 +245,8 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now great-pdf-generator
-systemctl status great-pdf-generator --no-pager
+sudo systemctl enable --now go-dynamic-pdf-generator
+systemctl status go-dynamic-pdf-generator --no-pager
 ```
 
 ### 3.4 Installing Chromium itself (the lean way, no snap)
@@ -295,11 +295,11 @@ scp -i <your-ssh-key.pem> pdfsvc ubuntu@<VM-IP>:/tmp/pdfsvc
 ```bash
 # On the VM:
 sudo install -m755 /tmp/pdfsvc /usr/local/bin/pdfsvc
-sudo useradd --system --home /var/lib/great-pdf-generator --create-home pdfsvc
+sudo useradd --system --home /var/lib/go-dynamic-pdf-generator --create-home pdfsvc
 ```
 
 To ship an update later, repeat: rebuild, `scp`, `sudo install -m755 ...`, then
-`sudo systemctl restart great-pdf-generator`.
+`sudo systemctl restart go-dynamic-pdf-generator`.
 
 ---
 
@@ -443,7 +443,7 @@ Flip the calling server's config to point at the new service. This is your (brie
 downtime window — a normal deploy, not an emergency. Watch closely:
 
 ```bash
-journalctl -u great-pdf-generator -f
+journalctl -u go-dynamic-pdf-generator -f
 curl -s localhost:8080/readyz
 ```
 
@@ -463,14 +463,14 @@ Once you've watched real traffic succeed for a day or two (not just the first ho
   `restarts` stays flat means Chromium can't start at all (bad path, out of memory, full disk), not
   a transient issue that will resolve itself.
 - **Logs**: structured JSON on stdout, one line per request, viewable via
-  `journalctl -u great-pdf-generator -f`. Set `LOG_LEVEL=debug` only when actively diagnosing
+  `journalctl -u go-dynamic-pdf-generator -f`. Set `LOG_LEVEL=debug` only when actively diagnosing
   something — health probes are chatty at that level.
 - **When to upgrade the VM, not just retune config**: if you see swap usage climbing under real
   traffic and response times degrading, that's this box's real ceiling, not a settings problem —
   move to a bigger instance (4GB+ RAM) rather than continuing to tune `POOL_SIZE`/concurrency
   downward.
 - **Updating the binary**: rebuild, `scp` it up, `sudo install -m755 /tmp/pdfsvc /usr/local/bin/pdfsvc`,
-  `sudo systemctl restart great-pdf-generator`. The graceful shutdown built into the service means
+  `sudo systemctl restart go-dynamic-pdf-generator`. The graceful shutdown built into the service means
   in-flight renders finish before the restart takes effect.
 - **Recurring disk hygiene** (not just a one-time migration step): `sudo journalctl --vacuum-time=7d`
   and `sudo apt-get clean` are safe to run periodically, e.g. via a monthly cron job, on any small VM.
