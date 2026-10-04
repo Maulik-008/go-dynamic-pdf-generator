@@ -16,9 +16,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"regexp"
+	"sort"
 	"time"
 )
 
@@ -68,7 +70,14 @@ type responseRecorder struct {
 	status      int
 	bytes       int
 	wroteHeader bool
+
+	// errBody keeps the first bytes of an error response so the pdf_render
+	// record can report the error code the client actually received, without
+	// every handler call site having to pass it up.
+	errBody []byte
 }
+
+const maxErrBodyCapture = 2048
 
 func (r *responseRecorder) WriteHeader(code int) {
 	if r.wroteHeader {
@@ -87,6 +96,13 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 		// without calling WriteHeader.
 		r.WriteHeader(http.StatusOK)
 	}
+	if r.status >= http.StatusBadRequest && len(r.errBody) < maxErrBodyCapture {
+		room := maxErrBodyCapture - len(r.errBody)
+		if len(b) < room {
+			room = len(b)
+		}
+		r.errBody = append(r.errBody, b[:room]...)
+	}
 	n, err := r.ResponseWriter.Write(b)
 	r.bytes += n
 	return n, err
@@ -103,7 +119,15 @@ func (r *responseRecorder) Unwrap() http.ResponseWriter { return r.ResponseWrite
 //
 // Before this existed the service logged nothing per request — only startup
 // and shutdown — so a failure in production left no trace at all.
-func RequestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
+//
+// Render requests additionally produce one `pdf_render` record (see
+// logRender), written to renderLog when WithRenderLog is given and to logger
+// otherwise.
+func RequestLogger(logger *slog.Logger, opts ...Option) func(http.Handler) http.Handler {
+	cfg := options{renderLog: logger}
+	for _, o := range opts {
+		o(&cfg)
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			id := r.Header.Get(requestIDHeader)
@@ -124,7 +148,8 @@ func RequestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 			// request's Pattern is still "" while the passed-down copy's is
 			// "POST /v1/pdf/html". Reading the outer one yields a route
 			// label that is silently always empty.
-			routed := r.WithContext(context.WithValue(r.Context(), ctxKey{}, id))
+			trace := NewTrace()
+			routed := r.WithContext(WithTrace(context.WithValue(r.Context(), ctxKey{}, id), trace))
 
 			start := time.Now()
 			next.ServeHTTP(rec, routed)
@@ -152,6 +177,10 @@ func RequestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 
 			logger.LogAttrs(routed.Context(), levelFor(r.URL.Path, rec.status),
 				"http_request", toAttrs(attrs)...)
+
+			if trace.Active() {
+				logRender(cfg.renderLog, routed.Context(), id, routed.Pattern, rec, elapsed, trace)
+			}
 		})
 	}
 }
@@ -197,4 +226,118 @@ func toAttrs(kv []any) []slog.Attr {
 		attrs = append(attrs, slog.Any(key, kv[i+1]))
 	}
 	return attrs
+}
+
+// Option configures RequestLogger.
+type Option func(*options)
+
+type options struct {
+	renderLog *slog.Logger
+}
+
+// WithRenderLog sends pdf_render records to l instead of the main logger —
+// typically a logger that also writes a dedicated JSONL file so the records
+// can be collected and compared without filtering the whole service log.
+func WithRenderLog(l *slog.Logger) Option {
+	return func(o *options) {
+		if l != nil {
+			o.renderLog = l
+		}
+	}
+}
+
+// Engine identifies this service in pdf_render records. The Node service logs
+// "node-puppeteer"; the shared field is what lets the two be told apart.
+const Engine = "go-chromedp"
+
+// logRender emits the single `pdf_render` record for a completed render
+// request. Its field and phase names are a contract with the Node service —
+// see docs/guides/09-render-logging.md.
+func logRender(l *slog.Logger, ctx context.Context, id, route string, rec *responseRecorder, elapsed time.Duration, t *Trace) {
+	phases, info := t.snapshot()
+
+	timings := make([]any, 0, len(phases)+1)
+	timings = append(timings, slog.Float64("total", roundMs(elapsed)))
+	names := make([]string, 0, len(phases))
+	for k := range phases {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, k := range names {
+		timings = append(timings, slog.Float64(k, phases[k]))
+	}
+
+	outcome := "ok"
+	if rec.status >= http.StatusBadRequest {
+		outcome = "error"
+	}
+
+	attrs := []slog.Attr{
+		slog.String("engine", Engine),
+		slog.String("request_id", id),
+		slog.String("route", route),
+		slog.Int("status", rec.status),
+		slog.String("outcome", outcome),
+	}
+	if outcome == "error" {
+		code, msg := parseErrorEnvelope(rec.errBody)
+		attrs = append(attrs, slog.String("error_code", code), slog.String("error_message", truncate(msg, 200)))
+	}
+	attrs = append(attrs,
+		slog.Int("content_bytes", info.ContentBytes),
+		slog.String("content_sha256", info.ContentSHA256),
+		slog.Group("options",
+			"paper_in", info.PaperIn,
+			"landscape", info.Landscape,
+			"fit_to_page", info.FitToPage,
+			"embed_images", info.EmbedImages,
+			"overlay", info.Overlay,
+			"overlay_pages", info.OverlayPages,
+		),
+	)
+	if img := info.Images; img != nil {
+		attrs = append(attrs, slog.Group("images",
+			"found", img.Found, "embedded", img.Embedded,
+			"failed", img.Failed, "skipped", img.Skipped, "bytes", img.Bytes))
+	}
+	if outcome == "ok" {
+		attrs = append(attrs, slog.Int("output_bytes", rec.bytes))
+	}
+	if info.PageCount > 0 {
+		attrs = append(attrs, slog.Int("page_count", info.PageCount))
+	}
+	if info.OverlayReservedPx > 0 {
+		attrs = append(attrs, slog.Int("overlay_reserved_px", info.OverlayReservedPx))
+	}
+	if info.FitScale != nil {
+		attrs = append(attrs, slog.Float64("fit_scale", *info.FitScale))
+	}
+	if info.FitOverflow != nil {
+		attrs = append(attrs, slog.Bool("fit_overflow", *info.FitOverflow))
+	}
+	attrs = append(attrs, slog.Group("timings_ms", timings...))
+
+	l.LogAttrs(ctx, levelFor("", rec.status), "pdf_render", attrs...)
+}
+
+// parseErrorEnvelope extracts {"error":{"code","message"}} from a captured
+// error body; both are empty if the body is not that shape.
+func parseErrorEnvelope(body []byte) (code, message string) {
+	var env struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &env) != nil {
+		return "", ""
+	}
+	return env.Error.Code, env.Error.Message
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }

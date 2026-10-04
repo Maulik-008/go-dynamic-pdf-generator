@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/observability"
 )
 
 // defaultRestartCooldown is the minimum interval between restart attempts for
@@ -391,6 +393,7 @@ func (s *poolSlot) noteRenderOutcome(err error) {
 // bounded by the pool size so a fully broken pool fails fast instead of
 // looping.
 func (p *Pool) acquire(ctx context.Context) (*poolSlot, *Renderer, func(), error) {
+	defer observability.TraceFrom(ctx).Start("acquire")()
 	var lastErr error
 	for attempt := 0; attempt < len(p.instances); attempt++ {
 		idx := p.next.Add(1) % uint64(len(p.instances))

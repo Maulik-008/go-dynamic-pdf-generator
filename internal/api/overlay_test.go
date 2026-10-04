@@ -188,3 +188,48 @@ func TestHandleHTMLLite_Overlay_Rejected(t *testing.T) {
 		t.Error("html-lite should not render when it also carries an unsupported overlay option")
 	}
 }
+
+func TestHandleHTML_Overlay_LastPageReservesSpaceForIt(t *testing.T) {
+	fr := &fakeRenderer{htmlPDF: realPDF(t, 2)}
+	srv := NewServer(fr, nil, nil, nil)
+
+	body := `{"content":"<h1>m</h1>","options":{"overlay":{"html":"<div>page {{totalPages}} of {{totalPages}}</div>","pages":"last"}}}`
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, jsonReq(t, "/v1/pdf/html", body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	if got := fr.htmlOpts[0].OverlayReserveHTML; got != "<div>page 99 of 99</div>" {
+		t.Errorf("main render OverlayReserveHTML = %q, want the overlay with a stand-in page count", got)
+	}
+	if got := fr.htmlOpts[1].OverlayReserveHTML; got != "" {
+		t.Errorf("the overlay fragment must not reserve space for itself, got %q", got)
+	}
+}
+
+func TestHandleHTML_Overlay_NonLastPageDoesNotReserve(t *testing.T) {
+	for _, pages := range []string{"first", "all", "1"} {
+		fr := &fakeRenderer{htmlPDF: realPDF(t, 2)}
+		srv := NewServer(fr, nil, nil, nil)
+		body := `{"content":"<h1>m</h1>","options":{"overlay":{"html":"<div>d</div>","pages":"` + pages + `"}}}`
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, jsonReq(t, "/v1/pdf/html", body))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("pages=%s status = %d; body=%s", pages, rec.Code, rec.Body.String())
+		}
+		if got := fr.htmlOpts[0].OverlayReserveHTML; got != "" {
+			t.Errorf("pages=%s: OverlayReserveHTML = %q, want none (a trailing spacer only controls the last page)", pages, got)
+		}
+	}
+}
+
+func TestHandleHTML_NoOverlay_NoReservation(t *testing.T) {
+	fr := &fakeRenderer{htmlPDF: realPDF(t, 1)}
+	srv := NewServer(fr, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, jsonReq(t, "/v1/pdf/html", `{"content":"<h1>m</h1>"}`))
+	if got := fr.htmlOpts[0].OverlayReserveHTML; got != "" {
+		t.Errorf("OverlayReserveHTML = %q, want empty when no overlay was requested", got)
+	}
+}

@@ -137,3 +137,29 @@ func TestApply_RendererErrorIsWrappedNotMasked(t *testing.T) {
 		t.Errorf("error should name the failing step, got: %v", err)
 	}
 }
+
+func TestTargetsLastPage(t *testing.T) {
+	for sel, want := range map[string]bool{
+		"": true, "last": true, "LAST": true, " last ": true,
+		"first": false, "all": false, "3": false, "2-4": false, "bogus": false,
+	} {
+		if got := TargetsLastPage(sel); got != want {
+			t.Errorf("TargetsLastPage(%q) = %v, want %v", sel, got, want)
+		}
+	}
+}
+
+func TestReserveHTML_UsesStandInPageCount(t *testing.T) {
+	got := ReserveHTML(Spec{HTML: "<p>{{totalPages}} / {{totalPages}}</p>"})
+	if got != "<p>99 / 99</p>" {
+		t.Errorf("ReserveHTML = %q", got)
+	}
+}
+
+func TestFragmentOptions_DoesNotReserveForItself(t *testing.T) {
+	base := renderengines.DefaultRenderOptions()
+	base.OverlayReserveHTML = "<div>x</div>"
+	if got := fragmentOptions(base).OverlayReserveHTML; got != "" {
+		t.Errorf("fragmentOptions kept OverlayReserveHTML = %q", got)
+	}
+}

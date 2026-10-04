@@ -48,6 +48,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # boundary is the only isolation layer around code that renders
 # customer-supplied HTML — so not running that as root matters.
 RUN useradd --system --create-home --uid 10001 pdfsvc
+
+# Working directory the service can write to, so the render log's default
+# relative path (logs/pdf-render.jsonl) works with no env setting. Mount a
+# volume on .../logs to keep it across container restarts (docker-compose.yml
+# does).
+RUN mkdir -p /var/lib/go-dynamic-pdf-generator/logs \
+    && chown -R pdfsvc:pdfsvc /var/lib/go-dynamic-pdf-generator
+WORKDIR /var/lib/go-dynamic-pdf-generator
+
 USER pdfsvc
 
 COPY --from=build /out/pdfsvc /usr/local/bin/pdfsvc

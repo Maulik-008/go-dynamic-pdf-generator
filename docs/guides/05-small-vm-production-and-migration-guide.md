@@ -229,7 +229,7 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 # Graceful shutdown: must exceed SHUTDOWN_GRACE plus the longest render
-# (30s default), or systemd SIGKILLs mid-drain and orphans Chromium.
+# (45s default), or systemd SIGKILLs mid-drain and orphans Chromium.
 KillSignal=SIGTERM
 TimeoutStopSec=60
 KillMode=control-group
@@ -243,6 +243,8 @@ PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
 StateDirectory=go-dynamic-pdf-generator
+# Render timing log lands in <this dir>/logs/ (see 09-render-logging.md); no env needed.
+WorkingDirectory=/var/lib/go-dynamic-pdf-generator
 Environment=HOME=/var/lib/go-dynamic-pdf-generator
 
 # Sized for a ~2GB-RAM VM: leaves ~500-600MB headroom for the OS/sshd, so

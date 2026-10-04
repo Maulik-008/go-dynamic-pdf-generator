@@ -71,6 +71,16 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
 	slog.SetDefault(logger)
 
+	// Every pdf_render record (and only those) is also appended to a rotated
+	// JSONL file, on by default with its location defined in code
+	// (observability.DefaultRenderLogConfig) — no env needed. If the file
+	// cannot be opened the service warns and carries on: stdout still has every
+	// record. See docs/guides/09-render-logging.md.
+	renderLogger, renderLogCloser := observability.NewRenderLogger(
+		observability.RenderLogConfigFromEnv(os.Getenv), logLevel(), os.Stdout, logger)
+	defer renderLogCloser.Close()
+	requestLogOpts := []observability.Option{observability.WithRenderLog(renderLogger)}
+
 	chromiumPath := os.Getenv("CHROMIUM_PATH")
 	if chromiumPath == "" {
 		log.Fatal("CHROMIUM_PATH must be set to a headless Chromium / chrome-headless-shell binary")
@@ -170,14 +180,14 @@ func main() {
 		Addr: addr(),
 		// Auth sits inside request logging so a rejected request is still
 		// logged with its correlation id.
-		Handler:           observability.RequestLogger(logger)(authn.Middleware(srv.Routes())),
+		Handler:           observability.RequestLogger(logger, requestLogOpts...)(authn.Middleware(srv.Routes())),
 		ReadHeaderTimeout: 10 * time.Second,
 		// WriteTimeout is a few seconds above the default render budget
-		// (renderengines.DefaultRenderOptions().Timeout, currently 30s) so a
+		// (renderengines.DefaultRenderOptions().Timeout, currently 45s) so a
 		// legitimate slow render isn't cut off mid-response, while still
 		// bounding a slow-reading client from holding a handler goroutine
 		// open indefinitely after the render itself has completed.
-		WriteTimeout: 40 * time.Second,
+		WriteTimeout: 55 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 

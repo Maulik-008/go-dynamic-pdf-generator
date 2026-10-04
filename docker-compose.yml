@@ -72,3 +72,12 @@ services:
     # privileges it needs), so the container boundary is the real one.
     security_opt:
       - no-new-privileges:true
+
+    # Render timing log (logs/pdf-render.jsonl under the image's working
+    # directory), kept across container restarts. The image creates this
+    # directory owned by the service user, which a new named volume inherits.
+    volumes:
+      - pdf-logs:/var/lib/go-dynamic-pdf-generator/logs
+
+volumes:
+  pdf-logs:

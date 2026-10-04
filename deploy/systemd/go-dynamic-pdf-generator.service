@@ -38,7 +38,7 @@ StartLimitBurst=5
 
 # Graceful shutdown: SIGTERM makes the service fail readiness, wait out
 # SHUTDOWN_GRACE, then drain in-flight renders. TimeoutStopSec must exceed
-# SHUTDOWN_GRACE plus the longest render (RenderOptions.Timeout, 30s by
+# SHUTDOWN_GRACE plus the longest render (RenderOptions.Timeout, 45s by
 # default) or systemd will SIGKILL mid-drain and orphan Chromium processes.
 KillSignal=SIGTERM
 TimeoutStopSec=60
@@ -67,6 +67,12 @@ LockPersonality=true
 
 # Chromium needs a writable home for its profile/cache.
 StateDirectory=go-dynamic-pdf-generator
+# The process's working directory is the service's own writable state dir
+# (ProtectSystem=strict leaves everything else read-only). The render log's
+# default relative path, logs/pdf-render.jsonl, resolves under it with no env
+# setting: /var/lib/go-dynamic-pdf-generator/logs/. Without this the working
+# directory is /, the log cannot be opened, and only stdout/journald is used.
+WorkingDirectory=/var/lib/go-dynamic-pdf-generator
 Environment=HOME=/var/lib/go-dynamic-pdf-generator
 
 # Chromium legitimately needs a large shared-memory area; too small a
