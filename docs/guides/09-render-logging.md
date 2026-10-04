@@ -12,13 +12,34 @@ two services produce equivalent results and which one is faster.
 
 ## Where the records go
 
-| Service | Always | Dedicated file |
+| Service | Always | Dedicated file (on by default, no env needed) |
 |---|---|---|
-| Go | stdout (journald / `docker logs`) | set `RENDER_LOG_FILE=/var/log/go-dynamic-pdf-generator/pdf-render.jsonl` — records are *also* appended there |
-| Node | — | `logs/pdf-render.jsonl` by default, or `RENDER_LOG_FILE`; rotates at 50 MB, keeps 10 files |
+| Go | stdout (journald / `docker logs`) | `logs/pdf-render.jsonl` under the working directory; rotates at 50 MB, keeps 10 files |
+| Node | — | `logs/pdf-render.jsonl` under the working directory; rotates at 50 MB, keeps 10 files |
 
-The Go file is not rotated by the service; use logrotate with `copytruncate`. Node's records are
-written only to its dedicated file (plus the console outside production), not to `combined.log`.
+**Go.** The defaults live in code (`observability.DefaultRenderLogConfig`), not in `.env`. The path
+is relative, so it resolves against the process's working directory:
+
+- **Development** — the repo root, so the file is `logs/pdf-render.jsonl` inside the repo. `logs/`
+  is tracked only for its own `.gitignore` (`*` / `!.gitignore`), so the log files are never committed.
+- **systemd** — the unit sets `WorkingDirectory=/var/lib/go-dynamic-pdf-generator` (the service's
+  own writable state directory; the server has the binary only, no repo, and the rest of the
+  filesystem is read-only), giving `/var/lib/go-dynamic-pdf-generator/logs/pdf-render.jsonl`. **An
+  already-installed unit must be updated once** (copy the new unit, `systemctl daemon-reload`,
+  restart) — until then the working directory is `/`, the file cannot be opened, and the service
+  logs one `render log file unavailable` warning and carries on with stdout only.
+- **Docker** — the image's `WORKDIR` is `/var/lib/go-dynamic-pdf-generator`, owned by the service
+  user; `docker-compose.yml` keeps `logs/` in a named volume.
+
+The file is a convenience copy: every record is also on stdout, so an unwritable location is a
+warning, never a startup failure. The service logs the resolved absolute path at startup
+(`render log file enabled`). Rotation is built in; no logrotate needed.
+
+Optional override (not needed normally): `RENDER_LOG_FILE=/some/path.jsonl` moves the file, and
+`RENDER_LOG_FILE=off` disables it.
+
+Node's records are written only to its dedicated file (plus the console outside production), not to
+`combined.log`; its `logs/` directory is already gitignored.
 
 Both emit `time` (RFC 3339), `level`, `msg`. A request with no render activity (`/health`, `/livez`,
 a request rejected by API-key auth) produces no `pdf_render` record.

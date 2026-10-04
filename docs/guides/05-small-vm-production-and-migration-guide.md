@@ -243,6 +243,8 @@ PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
 StateDirectory=go-dynamic-pdf-generator
+# Render timing log lands in <this dir>/logs/ (see 09-render-logging.md); no env needed.
+WorkingDirectory=/var/lib/go-dynamic-pdf-generator
 Environment=HOME=/var/lib/go-dynamic-pdf-generator
 
 # Sized for a ~2GB-RAM VM: leaves ~500-600MB headroom for the OS/sshd, so

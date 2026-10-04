@@ -71,20 +71,15 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
 	slog.SetDefault(logger)
 
-	// RENDER_LOG_FILE additionally appends every pdf_render record (and only
-	// those) to a JSONL file, so render timings can be collected and compared
-	// with the Node service without filtering the whole service log. Rotation
-	// is left to logrotate (copytruncate), see docs/guides/09-render-logging.md.
-	var requestLogOpts []observability.Option
-	if path := os.Getenv("RENDER_LOG_FILE"); path != "" {
-		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o640)
-		if err != nil {
-			log.Fatalf("RENDER_LOG_FILE: %v", err)
-		}
-		defer f.Close()
-		requestLogOpts = append(requestLogOpts, observability.WithRenderLog(
-			slog.New(slog.NewJSONHandler(io.MultiWriter(os.Stdout, f), &slog.HandlerOptions{Level: logLevel()}))))
-	}
+	// Every pdf_render record (and only those) is also appended to a rotated
+	// JSONL file, on by default with its location defined in code
+	// (observability.DefaultRenderLogConfig) — no env needed. If the file
+	// cannot be opened the service warns and carries on: stdout still has every
+	// record. See docs/guides/09-render-logging.md.
+	renderLogger, renderLogCloser := observability.NewRenderLogger(
+		observability.RenderLogConfigFromEnv(os.Getenv), logLevel(), os.Stdout, logger)
+	defer renderLogCloser.Close()
+	requestLogOpts := []observability.Option{observability.WithRenderLog(renderLogger)}
 
 	chromiumPath := os.Getenv("CHROMIUM_PATH")
 	if chromiumPath == "" {

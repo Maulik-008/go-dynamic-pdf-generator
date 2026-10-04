@@ -1,0 +1,3 @@
+# Render logs are runtime output: keep this directory in the repo, ignore its contents.
+*
+!.gitignore
