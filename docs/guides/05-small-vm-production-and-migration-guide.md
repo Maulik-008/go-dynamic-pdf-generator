@@ -229,7 +229,7 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 # Graceful shutdown: must exceed SHUTDOWN_GRACE plus the longest render
-# (30s default), or systemd SIGKILLs mid-drain and orphans Chromium.
+# (45s default), or systemd SIGKILLs mid-drain and orphans Chromium.
 KillSignal=SIGTERM
 TimeoutStopSec=60
 KillMode=control-group

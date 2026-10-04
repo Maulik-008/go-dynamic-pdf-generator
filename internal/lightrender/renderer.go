@@ -17,7 +17,7 @@ import (
 )
 
 // defaultTimeout bounds a render when RenderOptions.Timeout is unset. Matches
-// renderengines.DefaultRenderOptions()'s own 30s default for consistency.
+// renderengines.DefaultRenderOptions()'s own 45s default for consistency.
 // Load-bearing, not just a nicety: RenderHTML has no page-load/JS-execution
 // phase to wait on the way the Chromium path does, but a pathological
 // CSS/HTML input (e.g. an expensive layout on a deeply nested table) can
@@ -28,7 +28,7 @@ import (
 // docs/planning/SPEC-job-orchestration.md), and a render that never returns
 // would pin one of those few workers forever, permanently shrinking the
 // pool's real capacity one hung request at a time.
-const defaultTimeout = 30 * time.Second
+const defaultTimeout = 45 * time.Second
 
 // Config configures a Renderer.
 type Config struct {

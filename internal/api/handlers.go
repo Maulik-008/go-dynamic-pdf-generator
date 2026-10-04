@@ -17,11 +17,14 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/assets"
 	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/customization"
 	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/lightrender"
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/observability"
 	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/orchestration"
 	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/overlay"
 	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
@@ -153,6 +156,26 @@ func submit[T any](ctx context.Context, pool *orchestration.Pool, fn func(contex
 		return fn(ctx)
 	}
 	return orchestration.Submit(ctx, pool, fn)
+}
+
+// tracedSubmit is submit plus pdf_render timings: "queue_wait" is the time
+// spent waiting for admission to a worker, "render" is the time fn itself
+// ran. The names pick up a scope prefix when ctx carries a scoped trace (the
+// overlay fragment render), so they never mix into the main document's.
+func tracedSubmit[T any](ctx context.Context, pool *orchestration.Pool, fn func(context.Context) (T, error)) (T, error) {
+	tr := observability.TraceFrom(ctx)
+	queued := time.Now()
+	var ran atomic.Bool
+	res, err := submit(ctx, pool, func(ctx context.Context) (T, error) {
+		ran.Store(true)
+		tr.Add("queue_wait", time.Since(queued))
+		defer tr.Start("render")()
+		return fn(ctx)
+	})
+	if !ran.Load() { // rejected or cancelled while still waiting
+		tr.Add("queue_wait", time.Since(queued))
+	}
+	return res, err
 }
 
 // Routes returns the HTTP handler for every conversion endpoint.
@@ -317,7 +340,8 @@ type routeCaps struct {
 type gatedHTMLRenderer struct{ s *Server }
 
 func (g gatedHTMLRenderer) RenderHTML(ctx context.Context, html string, opts renderengines.RenderOptions) ([]byte, error) {
-	return submit(ctx, g.s.jobPool, func(ctx context.Context) ([]byte, error) {
+	ctx = observability.WithTrace(ctx, observability.TraceFrom(ctx).Scoped("overlay_"))
+	return tracedSubmit(ctx, g.s.jobPool, func(ctx context.Context) ([]byte, error) {
 		return g.s.renderer.RenderHTML(ctx, html, opts)
 	})
 }
@@ -330,6 +354,7 @@ func (s *Server) maybeOverlay(ctx context.Context, pdf []byte, spec *overlay.Spe
 	if spec == nil {
 		return pdf, nil
 	}
+	defer observability.TraceFrom(ctx).Start("overlay")()
 	return overlay.Apply(ctx, gatedHTMLRenderer{s}, pdf, *spec, base)
 }
 
@@ -339,16 +364,30 @@ func (s *Server) maybeOverlay(ctx context.Context, pdf []byte, spec *overlay.Spe
 // already written the error envelope and returns ok=false. overlaySpec is
 // non-nil only when the request asked for one and the route allows it.
 func (s *Server) prepareRender(w http.ResponseWriter, r *http.Request, caps routeCaps) (content string, opts renderengines.RenderOptions, fitToPage bool, overlaySpec *overlay.Spec, ok bool) {
+	tr := observability.TraceFrom(r.Context())
+	stopParse := sync.OnceFunc(tr.Start("request_parse"))
+	defer stopParse()
+
 	req, ok := decodeConversionRequest(w, r)
 	if !ok {
 		return "", opts, false, nil, false
 	}
+	// Fingerprint the content exactly as the caller sent it, before any
+	// merge or image embedding, and record the effective options as soon as
+	// they are known — so a request rejected further down still carries
+	// enough in its pdf_render record to be matched against the other service.
+	contentBytes, contentSHA := observability.ContentFingerprint(req.Content)
+	tr.Update(func(i *observability.RenderInfo) { i.ContentBytes, i.ContentSHA256 = contentBytes, contentSHA })
 
 	opts, embedImages, fitToPage, err := req.Options.resolve(s.renderDefaults)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
 		return "", opts, false, nil, false
 	}
+	tr.Update(func(i *observability.RenderInfo) {
+		i.PaperIn = strconv.FormatFloat(opts.PaperWidth, 'f', -1, 64) + "x" + strconv.FormatFloat(opts.PaperHeight, 'f', -1, 64)
+		i.Landscape, i.FitToPage, i.EmbedImages = opts.Landscape, fitToPage, embedImages
+	})
 	if fitToPage && !caps.allowFitToPage {
 		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "options.fitToPage is only supported on /v1/pdf/html")
 		return "", opts, false, nil, false
@@ -359,6 +398,15 @@ func (s *Server) prepareRender(w http.ResponseWriter, r *http.Request, caps rout
 	}
 
 	if req.Options != nil {
+		// Record that an overlay was asked for even if its selector turns out
+		// to be invalid, so the rejected request is still attributable.
+		if ov := req.Options.Overlay; ov != nil {
+			pages := "last"
+			if ov.Pages != nil {
+				pages = *ov.Pages
+			}
+			tr.Update(func(i *observability.RenderInfo) { i.Overlay, i.OverlayPages = true, pages })
+		}
 		overlaySpec, err = req.Options.Overlay.spec()
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
@@ -375,13 +423,28 @@ func (s *Server) prepareRender(w http.ResponseWriter, r *http.Request, caps rout
 		return "", opts, false, nil, false
 	}
 
+	// A last-page overlay (the disclaimer box) is stamped on after rendering
+	// and is taller than the print margin, so on a nearly-full last page it
+	// would sit on top of real content. Have the renderer keep room for it.
+	if overlaySpec != nil && overlay.TargetsLastPage(overlaySpec.Pages) {
+		opts.OverlayReserveHTML = overlay.ReserveHTML(*overlaySpec)
+	}
+
+	stopParse()
+
 	if embedImages {
 		if s.imageEmbedding == nil {
 			writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "options.embedImages is not enabled on this server")
 			return "", opts, false, nil, false
 		}
+		stopEmbed := tr.Start("embed_images")
 		embedded, stats := assets.Embed(r.Context(), content, *s.imageEmbedding)
+		stopEmbed()
 		content = embedded
+		tr.Update(func(i *observability.RenderInfo) {
+			i.Images = &observability.ImageInfo{Found: stats.Total, Embedded: stats.Embedded,
+				Failed: stats.Failed, Skipped: stats.Skipped, Bytes: stats.Bytes}
+		})
 		if stats.Total > 0 {
 			slog.InfoContext(r.Context(), "embedded remote images",
 				"found", stats.Total, "embedded", stats.Embedded,
@@ -397,13 +460,20 @@ func (s *Server) handleHTML(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tr := observability.TraceFrom(r.Context())
+
 	if fitToPage {
-		res, err := submit(r.Context(), s.jobPool, func(ctx context.Context) (renderengines.FittedRender, error) {
+		res, err := tracedSubmit(r.Context(), s.jobPool, func(ctx context.Context) (renderengines.FittedRender, error) {
 			return s.renderer.RenderHTMLFitted(ctx, content, opts)
 		})
 		if writeRenderError(w, err) {
 			return
 		}
+		tr.Update(func(i *observability.RenderInfo) {
+			i.PageCount = observability.CountPDFPages(res.PDF)
+			scale, overflowed := res.Scale, res.Overflowed
+			i.FitScale, i.FitOverflow = &scale, &overflowed
+		})
 		pdf, err := s.maybeOverlay(r.Context(), res.PDF, overlaySpec, opts)
 		if writeRenderError(w, err) {
 			return
@@ -416,12 +486,13 @@ func (s *Server) handleHTML(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pdf, err := submit(r.Context(), s.jobPool, func(ctx context.Context) ([]byte, error) {
+	pdf, err := tracedSubmit(r.Context(), s.jobPool, func(ctx context.Context) ([]byte, error) {
 		return s.renderer.RenderHTML(ctx, content, opts)
 	})
 	if writeRenderError(w, err) {
 		return
 	}
+	tr.Update(func(i *observability.RenderInfo) { i.PageCount = observability.CountPDFPages(pdf) })
 	pdf, err = s.maybeOverlay(r.Context(), pdf, overlaySpec, opts)
 	if writeRenderError(w, err) {
 		return
@@ -434,7 +505,7 @@ func (s *Server) handleMarkdown(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	pdf, err := submit(r.Context(), s.jobPool, func(ctx context.Context) ([]byte, error) {
+	pdf, err := tracedSubmit(r.Context(), s.jobPool, func(ctx context.Context) ([]byte, error) {
 		return s.renderer.RenderMarkdown(ctx, content, opts)
 	})
 	if writeRenderError(w, err) {
@@ -462,7 +533,7 @@ func (s *Server) handleHTMLLite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pdf, err := submit(r.Context(), s.staticJobPool, func(ctx context.Context) ([]byte, error) {
+	pdf, err := tracedSubmit(r.Context(), s.staticJobPool, func(ctx context.Context) ([]byte, error) {
 		return s.staticRenderer.RenderHTML(ctx, content, lightrender.RenderOptions{Timeout: opts.Timeout})
 	})
 	if writeRenderError(w, err) {

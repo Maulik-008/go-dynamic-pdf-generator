@@ -7,6 +7,7 @@ package renderengines
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -16,6 +17,8 @@ import (
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
+
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/observability"
 )
 
 // Config configures a Renderer.
@@ -166,13 +169,16 @@ func (r *Renderer) RenderHTML(ctx context.Context, html string, opts RenderOptio
 		}
 	}()
 
+	tr := observability.TraceFrom(ctx)
 	var pdfBuf []byte
 	err := chromedp.Run(taskCtx,
-		chromedp.Navigate("about:blank"),
-		injectDocument(html),
-		chromedp.WaitReady("body", chromedp.ByQuery),
-		waitForLoad(opts),
-		printToPDF(opts, &pdfBuf),
+		tabOpened(tr),
+		timed(tr, "navigate", chromedp.Navigate("about:blank")),
+		timed(tr, "set_content", injectDocument(html)),
+		timed(tr, "wait_ready", chromedp.WaitReady("body", chromedp.ByQuery)),
+		waitForLoad(tr, opts),
+		reserveOverlaySpace(tr, opts),
+		timed(tr, "print_pdf", printToPDF(opts, &pdfBuf)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("renderengines: render html: %w", err)
@@ -249,18 +255,24 @@ func (r *Renderer) RenderHTMLFitted(ctx context.Context, html string, opts Rende
 	viewportWidthPx := int64(math.Round(pageWidthIn * cssPxPerInch))
 	availableHeightPx := (pageHeightIn - opts.MarginTop - opts.MarginBottom) * cssPxPerInch
 
+	tr := observability.TraceFrom(ctx)
 	scale := 1.0
 	overflowed := false
 	var pdfBuf []byte
 	err := chromedp.Run(taskCtx,
-		chromedp.EmulateViewport(viewportWidthPx, 1000),
-		chromedp.Navigate("about:blank"),
-		injectDocument(html),
-		chromedp.WaitReady("body", chromedp.ByQuery),
-		waitForLoad(opts),
+		tabOpened(tr),
+		timed(tr, "viewport", chromedp.EmulateViewport(viewportWidthPx, 1000)),
+		timed(tr, "navigate", chromedp.Navigate("about:blank")),
+		timed(tr, "set_content", injectDocument(html)),
+		timed(tr, "wait_ready", chromedp.WaitReady("body", chromedp.ByQuery)),
+		waitForLoad(tr, opts),
+		reserveOverlaySpace(tr, opts),
 		chromedp.ActionFunc(func(ctx context.Context) error {
+			stopMeasure := tr.Start("measure")
 			var natural float64
-			if err := chromedp.Evaluate(naturalHeightJS, &natural).Do(ctx); err != nil {
+			err := chromedp.Evaluate(naturalHeightJS, &natural).Do(ctx)
+			stopMeasure()
+			if err != nil {
 				return fmt.Errorf("measure content height: %w", err)
 			}
 			if availableHeightPx > 0 && natural > availableHeightPx {
@@ -273,6 +285,7 @@ func (r *Renderer) RenderHTMLFitted(ctx context.Context, html string, opts Rende
 			}
 			fitted := opts
 			fitted.Scale = scale
+			defer tr.Start("print_pdf")()
 			data, _, err := printToPDFParams(fitted).Do(ctx)
 			if err != nil {
 				return fmt.Errorf("print to pdf: %w", err)
@@ -299,7 +312,7 @@ const naturalHeightJS = `Math.max(
 // measureHeightTimeout bounds MeasureHTMLHeight — it has no opts.Timeout of
 // its own (it's not a RenderOptions-shaped call), so a fixed, generous
 // budget matching DefaultRenderOptions().Timeout is used instead.
-const measureHeightTimeout = 30 * time.Second
+const measureHeightTimeout = 45 * time.Second
 
 // MeasureHTMLHeight renders htmlFragment (treated as body content — a
 // snippet, not a full document, matching Chromium's own header/footer
@@ -371,24 +384,134 @@ func (r *Renderer) MeasureHTMLHeight(ctx context.Context, htmlFragment string, v
 // waitForLoad waits for fonts and/or images to finish loading, per opts, so
 // the PDF snapshot doesn't get taken before the page is actually ready — the
 // most-cited accuracy bug across the engines surveyed in the research doc.
-func waitForLoad(opts RenderOptions) chromedp.Action {
+func waitForLoad(tr *observability.Trace, opts RenderOptions) chromedp.Action {
 	return chromedp.ActionFunc(func(ctx context.Context) error {
 		if opts.WaitForFonts {
-			if err := chromedp.Evaluate(`document.fonts.ready`, nil,
+			stop := tr.Start("wait_fonts")
+			err := chromedp.Evaluate(`document.fonts.ready`, nil,
 				func(p *runtime.EvaluateParams) *runtime.EvaluateParams {
 					return p.WithAwaitPromise(true)
-				}).Do(ctx); err != nil {
+				}).Do(ctx)
+			stop()
+			if err != nil {
 				return fmt.Errorf("wait for fonts: %w", err)
 			}
 		}
 		if opts.WaitForImages {
-			if err := chromedp.Evaluate(imagesLoadedJS, nil,
+			stop := tr.Start("wait_images")
+			err := chromedp.Evaluate(imagesLoadedJS, nil,
 				func(p *runtime.EvaluateParams) *runtime.EvaluateParams {
 					return p.WithAwaitPromise(true)
-				}).Do(ctx); err != nil {
+				}).Do(ctx)
+			stop()
+			if err != nil {
 				return fmt.Errorf("wait for images: %w", err)
 			}
 		}
+		return nil
+	})
+}
+
+// reserveOverlayJS measures the bottom-anchored height of an overlay fragment
+// in a hidden same-page iframe (so no extra tab is opened) and appends a
+// spacer to the document if the fragment would reach further up the page than
+// the print margin already keeps content away. Returns the spacer height in CSS
+// px, 0 when nothing was needed or the measurement could not be made.
+//
+// Only elements touching the bottom edge of the fragment's page count: that is
+// what "stamped at the bottom of the last page" means, and it stops an overlay
+// that also draws something mid-page from reserving most of the sheet. Trailing
+// whitespace the body already ends with (padding/border/margin) is credited,
+// since the overlay may legitimately cover blank space.
+const reserveOverlayJS = `async (html, vw, vh, marginPx) => {
+	try {
+		const frame = document.createElement('iframe');
+		frame.setAttribute('aria-hidden', 'true');
+		frame.style.cssText = 'position:fixed;left:-100000px;top:0;border:0;visibility:hidden;width:' + vw + 'px;height:' + vh + 'px';
+		await new Promise((resolve) => {
+			frame.onload = resolve;
+			frame.srcdoc = html;
+			document.body.appendChild(frame);
+		});
+		const doc = frame.contentDocument;
+		if (doc.fonts && doc.fonts.ready) await doc.fonts.ready;
+		let top = Infinity;
+		for (const el of doc.body.querySelectorAll('*')) {
+			const r = el.getBoundingClientRect();
+			if (r.width > 0 && r.height > 0 && r.bottom >= vh - 2) top = Math.min(top, r.top);
+		}
+		frame.remove();
+		if (!isFinite(top)) return 0;
+		const cs = getComputedStyle(document.body);
+		const trailing = (parseFloat(cs.paddingBottom) || 0) + (parseFloat(cs.borderBottomWidth) || 0) + (parseFloat(cs.marginBottom) || 0);
+		const need = Math.ceil((vh - top) - marginPx - trailing);
+		if (need <= 0) return 0;
+		const spacer = document.createElement('div');
+		spacer.setAttribute('data-overlay-reserve', '');
+		spacer.style.cssText = 'height:' + need + 'px;margin:0;padding:0;border:0;';
+		document.body.appendChild(spacer);
+		return need;
+	} catch (e) {
+		return 0;
+	}
+}`
+
+// reserveOverlaySpace runs reserveOverlayJS when opts.OverlayReserveHTML is
+// set. Best effort by design: if the measurement fails the document renders
+// exactly as it did before this existed, rather than failing the request.
+func reserveOverlaySpace(tr *observability.Trace, opts RenderOptions) chromedp.Action {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		if opts.OverlayReserveHTML == "" {
+			return nil
+		}
+		defer tr.Start("reserve_overlay")()
+
+		w, h := opts.PaperWidth, opts.PaperHeight
+		if opts.Landscape {
+			w, h = h, w
+		}
+		htmlJSON, err := json.Marshal(opts.OverlayReserveHTML)
+		if err != nil {
+			return nil
+		}
+		expr := fmt.Sprintf("(%s)(%s, %d, %d, %f)", reserveOverlayJS, htmlJSON,
+			int(math.Round(w*cssPxPerInch)), int(math.Round(h*cssPxPerInch)), opts.MarginBottom*cssPxPerInch)
+
+		var reserved float64
+		err = chromedp.Evaluate(expr, &reserved, func(p *runtime.EvaluateParams) *runtime.EvaluateParams {
+			return p.WithAwaitPromise(true)
+		}).Do(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			return nil
+		}
+		if reserved > 0 {
+			tr.Update(func(i *observability.RenderInfo) { i.OverlayReservedPx = int(reserved) })
+		}
+		return nil
+	})
+}
+
+// timed records how long a has to run under phase on tr. A nil tr makes it a
+// pass-through, so untraced callers pay nothing.
+func timed(tr *observability.Trace, phase string, a chromedp.Action) chromedp.Action {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		defer tr.Start(phase)()
+		return a.Do(ctx)
+	})
+}
+
+// tabOpened records the "tab_open" phase: chromedp allocates the new tab
+// lazily inside Run, before its first action executes, so the time from here
+// to that first action is the cost of opening a tab on the warm browser.
+// Must be the first action passed to a Run, with this call made immediately
+// before it.
+func tabOpened(tr *observability.Trace) chromedp.Action {
+	begin := time.Now()
+	return chromedp.ActionFunc(func(context.Context) error {
+		tr.Add("tab_open", time.Since(begin))
 		return nil
 	})
 }

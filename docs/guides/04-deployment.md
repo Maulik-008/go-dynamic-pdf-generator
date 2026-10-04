@@ -82,7 +82,7 @@ blindly:
   after 5 failures in 5 minutes and shows as `failed`, which someone can
   actually see.
 - **`TimeoutStopSec=60`** must stay above `SHUTDOWN_GRACE` plus your longest
-  render (30s default), or systemd SIGKILLs mid-drain and orphans browsers.
+  render (45s default), or systemd SIGKILLs mid-drain and orphans browsers.
 
 ## 4. Health endpoints
 

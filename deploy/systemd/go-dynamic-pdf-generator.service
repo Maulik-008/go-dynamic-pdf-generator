@@ -38,7 +38,7 @@ StartLimitBurst=5
 
 # Graceful shutdown: SIGTERM makes the service fail readiness, wait out
 # SHUTDOWN_GRACE, then drain in-flight renders. TimeoutStopSec must exceed
-# SHUTDOWN_GRACE plus the longest render (RenderOptions.Timeout, 30s by
+# SHUTDOWN_GRACE plus the longest render (RenderOptions.Timeout, 45s by
 # default) or systemd will SIGKILL mid-drain and orphan Chromium processes.
 KillSignal=SIGTERM
 TimeoutStopSec=60

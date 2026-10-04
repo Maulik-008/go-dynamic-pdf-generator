@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/observability"
 	"github.com/Maulik-008/go-dynamic-pdf-generator/internal/renderengines"
 )
 
@@ -76,7 +77,9 @@ func Apply(ctx context.Context, r FragmentRenderer, mainPDF []byte, spec Spec, b
 		return nil, fmt.Errorf("overlay: render fragment: %w", err)
 	}
 
+	stopStamp := observability.TraceFrom(ctx).Start("overlay_stamp")
 	out, err := stampPages(mainPDF, stampPDF, pages)
+	stopStamp()
 	if err != nil {
 		return nil, fmt.Errorf("overlay: stamp: %w", err)
 	}
@@ -97,7 +100,23 @@ func fragmentOptions(base renderengines.RenderOptions) renderengines.RenderOptio
 	o.DisplayHeaderFooter = false
 	o.HeaderTemplate, o.FooterTemplate = "", ""
 	o.PrintBackground = true
+	o.OverlayReserveHTML = "" // the fragment must not reserve space for itself
 	return o
+}
+
+// TargetsLastPage reports whether sel selects the document's final page
+// ("last", or empty). Only then can space be reserved for the overlay ahead
+// of time: the last page is the one place a trailing spacer controls.
+func TargetsLastPage(sel string) bool {
+	keyword, _, err := parseSelector(sel)
+	return err == nil && keyword == "last"
+}
+
+// ReserveHTML returns spec.HTML with {{totalPages}} replaced by a stand-in of
+// typical width, for measuring how much room the finished overlay will need
+// before the real page count is known.
+func ReserveHTML(spec Spec) string {
+	return strings.ReplaceAll(spec.HTML, totalPagesToken, "99")
 }
 
 // ValidatePages reports whether sel is a syntactically valid page selector

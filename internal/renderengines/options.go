@@ -44,10 +44,21 @@ type RenderOptions struct {
 
 	// Timeout bounds the whole render call, including any waiting above.
 	Timeout time.Duration
+
+	// OverlayReserveHTML, when set, is an HTML fragment that will later be
+	// stamped over the bottom of the document's LAST page (the options.overlay
+	// "last" case). The renderer measures how tall that fragment is when
+	// anchored to the page bottom and appends an empty spacer to the document
+	// so its content can never end underneath it; if the last content would
+	// run into that zone, the spacer pushes onto a new page and the overlay
+	// lands there instead of covering text. The bottom print margin is already
+	// off-limits to content, so only the part of the fragment taller than the
+	// margin needs reserving. Empty means no reservation.
+	OverlayReserveHTML string
 }
 
 // DefaultRenderOptions returns the recommended defaults: A4 portrait,
-// backgrounds on, wait for fonts and images, 30s timeout — "just works" for
+// backgrounds on, wait for fonts and images, 45s timeout — "just works" for
 // a typical business document, per the platform spec's Ease-of-use pillar.
 func DefaultRenderOptions() RenderOptions {
 	return RenderOptions{
@@ -61,7 +72,7 @@ func DefaultRenderOptions() RenderOptions {
 		MarginRight:     0.4,
 		WaitForFonts:    true,
 		WaitForImages:   true,
-		Timeout:         30 * time.Second,
+		Timeout:         45 * time.Second,
 	}
 }
 
